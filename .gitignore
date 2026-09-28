@@ -1,0 +1,42 @@
+# ===== app_data: solo estructura + READMEs se versionan =====
+app_data/**
+!app_data/
+!app_data/**/
+!app_data/**/README.md
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+*.spec
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== Node / WebUI (llama-server-ui) =====
+node_modules/
+llama-server-ui/dist/
+llama-server-ui/dev-dist/
+llama-server-ui/.svelte-kit/
+llama-server-ui/_check.log
+*.tsbuildinfo
+
+# ===== Entorno / secretos =====
+.env
+.env.*
+!llama-server-ui/.env.example
+*.local
+
+# ===== Datos locales y logs =====
+user_data/
+*.log
+logs/
+
+# ===== SO / editores =====
+Thumbs.db
+Desktop.ini
+.DS_Store

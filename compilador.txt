@@ -1,0 +1,1 @@
+pyinstaller --noconsole --onefile --icon=app.ico --add-data "app.ico;." --add-data "tools;tools" --collect-all "wx" --collect-all "piper" --collect-all "fastmcp" --collect-all "chromadb" --collect-all "fastapi" --hidden-import "chromadb" --hidden-import "flask" --hidden-import "fastmcp"  --hidden-import "piper" --hidden-import "faster_whisper" Llama_Server_Manager.py
