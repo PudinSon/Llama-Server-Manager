@@ -28,10 +28,12 @@
 	});
 
 	// El agente queda activo en segundo plano sin necesidad de abrir su modal.
+	// La reanudación de un job en curso NO se hace aquí: el dueño del stream es
+	// la página del chat (`chatStore.recoverAgencyJob`), que reconstruye la
+	// rama y alimenta esta timeline con los frames del backend.
 	$effect(() => {
 		agentStore.ensurePolling();
 		void agentStore.fetchAgencyAgents();
-		void agentStore.restoreActiveJob();
 	});
 </script>
 

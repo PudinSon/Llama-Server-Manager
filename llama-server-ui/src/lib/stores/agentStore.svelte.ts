@@ -9,9 +9,7 @@
 
 import { browser } from '$app/environment';
 import { apiToken, serviceBase } from '$lib/api';
-import { get } from 'svelte/store';
 import { toast } from 'svelte-sonner';
-import { ragResearchMode } from '$lib/stores/rag.svelte';
 
 export interface AgentStatus {
 	mode: string;
@@ -34,22 +32,39 @@ export interface AgentConfig {
 	showToasts: boolean;
 }
 
+/**
+ * Tipos que emite el stream del job agencial (`tools/agent_core.py`).
+ * Un evento desconocido no revienta el reductor (el tipo admite `string`),
+ * pero esta lista es el contrato que el panel SÍ sabe pintar.
+ */
 export type AgentEventType =
 	| 'text'
 	| 'reasoning'
 	| 'tool_call'
 	| 'native_tool_call'
 	| 'tool_result'
+	| 'tool_denied'
 	| 'step_start'
 	| 'step_end'
+	| 'agency_selected'
 	| 'plan'
+	| 'agent_start'
+	| 'agent_end'
+	| 'handoff'
+	| 'supervisor'
+	| 'usage'
+	| 'progress'
+	| 'incomplete'
 	| 'error'
 	| 'done';
 
 export interface AgentEvent {
 	type: AgentEventType | string;
 	data?: unknown;
+	payload?: unknown;
 	job_id?: string;
+	/** Papel y agente del frame: `{ role: 'specialist', agent: 'Analista' }`. */
+	meta?: Record<string, unknown>;
 	status?: string;
 	result?: unknown;
 	[key: string]: unknown;
@@ -72,11 +87,24 @@ export interface AgencyAgentDetail extends AgencyAgent {
 	content?: string;
 }
 
+/**
+ * Estado de un paso del plan. Lo mueve el reducer con los eventos REALES del
+ * backend (`step_start`/`agent_start` lo ponen en marcha, `agent_end`/
+ * `step_end` lo cierran), no con un campo `status` que nadie emite.
+ */
+export type AgencyPlanStatus = 'pending' | 'running' | 'done' | 'error';
+
 export interface AgencyPlanStep {
 	id: string;
 	subtask: string;
 	agent_name: string;
 	depends_on?: string[];
+	phases?: string[];
+	/** Fase del pipeline (`pipeline_templates`): setup, core, tests... */
+	phase?: string;
+	/** Artefacto que produce el paso (si lo declara). */
+	artifact?: string | null;
+	status: AgencyPlanStatus;
 }
 
 export type AgencyRunStatus = 'running' | 'done' | 'error';
@@ -89,8 +117,17 @@ export interface AgencyRun {
 	text: string;
 	reasoning: string;
 	error?: string;
+	/** Herramientas que la whitelist del agente le denegó (`tool_denied`). */
+	denied?: string[];
 	durationMs?: number;
 	startedAt: number;
+}
+
+/** Herramienta denegada por la policy del agente (`tool_denied`). */
+export interface AgencyDenial {
+	agent: string;
+	name: string;
+	reason: string;
 }
 
 const AGENT_CONFIG_KEY = 'agentStoreConfig';
@@ -164,7 +201,8 @@ function loadAgentConfig(): AgentConfig {
 	try {
 		const stored = localStorage.getItem(AGENT_CONFIG_KEY);
 		if (stored) {
-			const parsed = JSON.parse(stored);			return {
+			const parsed = JSON.parse(stored);
+			return {
 				agentMode: parsed.agentMode ?? true,
 				selectionMode: ['automatic', 'hybrid'].includes(parsed.selectionMode)
 					? parsed.selectionMode
@@ -208,7 +246,9 @@ async function requestAgent<T>(
 	path: string,
 	options: RequestInit = {}
 ): Promise<T> {
-	const headers: Record<string, string> = { ...(options.headers as Record<string, string> | undefined) };
+	const headers: Record<string, string> = {
+		...(options.headers as Record<string, string> | undefined)
+	};
 	if (options.body) headers['Content-Type'] = 'application/json';
 	// Token opcional de `api.ts` (@requires_auth en tools/auth.py).
 	const token = apiToken();
@@ -237,12 +277,10 @@ function createAgentStore() {
 	let status = $state<AgentStatus | null>(null);
 	let memory = $state<any[]>([]);
 	let skills = $state<any[]>([]);
-	let plan = $state<any | null>(null);
 	let isLoading = $state(false);
 	let lastError = $state<string | null>(null);
 	let lastRefresh = $state<number>(0);
 	let isConnected = $state<boolean | null>(null);
-	let currentJobId = $state<string | null>(null);
 	let events = $state<AgentEvent[]>([]);
 	let response = $state('');
 	let reasoning = $state<string[]>([]);
@@ -262,33 +300,51 @@ function createAgentStore() {
 	let selectionFilter = $state<'all' | 'selected' | 'available'>('all');
 	// --- Timeline agencial (modo AGENCY): plan, agentes trabajando, síntesis ---
 	let agencyPlan = $state<AgencyPlanStep[]>([]);
+	let agencyGoal = $state('');
 	let agencyPlanRevision = $state(0);
 	let agencyRuns = $state<AgencyRun[]>([]);
 	let agencySupervisor = $state('');
 	let agencyCurrentAgent = $state<string | null>(null);
-	let agencyUsage = $state<{ promptTokens: number; completionTokens: number; totalTokens: number; promptMs: number; completionMs: number } | null>(null);
+	let agencyUsage = $state<{
+		promptTokens: number;
+		completionTokens: number;
+		totalTokens: number;
+		promptMs: number;
+		completionMs: number;
+	} | null>(null);
 	let agencyProgress = $state<{ processed: number; total: number; cache: number } | null>(null);
+	/**
+	 * Motivo del último `incomplete` del backend: el plan se cerró sin que todos
+	 * los pasos produjeran trabajo (paso cortado por la guarda, artefacto que no
+	 * apareció o recuperación agotada). Es un aviso, no el fin del job: el
+	 * stream sigue y el `done` sin meta lo cierra.
+	 */
+	let agencyIncomplete = $state<string | null>(null);
+	/** Herramientas denegadas por la whitelist del agente, en orden de llegada. */
+	let agencyDenials = $state<AgencyDenial[]>([]);
 	// Conversación que lanzó la ejecución agencial. Sin esto la timeline se
 	// pintaba en TODOS los chats: el estado vive en el store global, que
 	// sobrevive al cambio de conversación.
 	let agencyConversationId = $state<string | null>(null);
-	let eventSource: EventSource | null = null;
-	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-	let reconnectAttempt = 0;
-
-	function closeEventSource() {
-		eventSource?.close();
-		eventSource = null;
-	}
+	// Este store NO abre el stream del job: el dueño del `EventSource` es el
+	// chat que lanzó la tarea (`chatStore.consumeAgencyJob` sobre el transporte
+	// `$lib/utils/agency-stream`), y de ahí sale cada frame hacia el reductor
+	// `applyChatAgencyEvent`. Antes el panel abría además su propia conexión con
+	// su propia lista de tipos y su propia reconexión: el mismo job se veía
+	// distinto según quién escuchara, y al reclamarlo el chat había que tirar la
+	// conexión del panel y reconstruir la timeline desde cero.
 
 	function resetAgencyTimeline(conversationId: string | null = null) {
 		agencyPlan = [];
+		agencyGoal = '';
 		agencyPlanRevision = 0;
 		agencyRuns = [];
 		agencySupervisor = '';
 		agencyCurrentAgent = null;
 		agencyUsage = null;
 		agencyProgress = null;
+		agencyIncomplete = null;
+		agencyDenials = [];
 		agencyConversationId = conversationId;
 	}
 
@@ -316,118 +372,130 @@ function createAgentStore() {
 		);
 	}
 
-	function resetExecution() {
-		closeEventSource();
-		if (reconnectTimer) clearTimeout(reconnectTimer);
-		reconnectTimer = null;
-		reconnectAttempt = 0;
-		currentJobId = null;
-		currentJobConversationId = null;
-		events = [];
-		response = '';
-		reasoning = [];
-		currentStep = '';
-		isExecuting = false;
-		resetAgencyTimeline();
-	}
+	/**
+	 * (Eliminado) Segundo reductor, `applyEvent`.
+	 *
+	 * El panel tenía su propio switch (texto, razonamiento, plan y cierre) y el
+	 * chat tenía otro (`applyChatAgencyEvent`): el mismo backend se veía distinto
+	 * según quién escuchara, y este se quedaba corto (sin `usage`, sin
+	 * `incomplete`, sin `tool_denied` y sin estados por paso del plan). Ahora hay
+	 * UN reductor —`applyChatAgencyEvent`— y los dos caminos pasan por él.
+	 */
 
-	function applyEvent(event: AgentEvent) {
-		events = [...events, event];
-		const value = event.data ?? event.payload;
-		const text = typeof value === 'string' ? value : '';
+	/**
+	 * Modelo ÚNICO del plan. `agency_selected` y `plan` traen los mismos pasos
+	 * (el segundo es la replanificación), así que los dos pasan por aquí.
+	 *
+	 * Los estados se conservan entre replanificaciones por id de paso: si la
+	 * recuperación reescribe el plan, lo ya terminado sigue terminado y solo el
+	 * paso correctivo (`1R1`) queda pendiente.
+	 */
+	const planFromSteps = (raw: unknown): AgencyPlanStep[] => {
+		if (!Array.isArray(raw)) return [];
 
-		switch (event.type) {
-			case 'text':
-				response += text || String((value as { text?: unknown } | undefined)?.text ?? '');
-				break;
-			case 'reasoning':
-				reasoning = [
-					...reasoning,
-					text || String((value as { text?: unknown } | undefined)?.text ?? '')
-				];
-				break;
-			case 'step_start':
-				currentStep =
-					text ||
-					String(
-						(value as { step?: unknown; subtask?: unknown; agent?: unknown } | undefined)?.step ??
-							(value as { subtask?: unknown } | undefined)?.subtask ??
-							(value as { agent?: unknown } | undefined)?.agent ??
-							''
-					);
-				break;
-			case 'plan':
-				plan = value;
-				break;
-			case 'done':
-				if (!response) {
-					const finalResult = (value as { result?: unknown } | undefined)?.result;
-					if (typeof finalResult === 'string') response = finalResult;
-					else if (finalResult && typeof finalResult === 'object') {
-						const content = (finalResult as { content?: unknown }).content;
-						if (typeof content === 'string') response = content;
-					}
-				}
-				isExecuting = false;
-				closeEventSource();
-				break;
-			case 'error':
-				lastError =
-					text || String((value as { error?: unknown } | undefined)?.error ?? 'Agent error');
-				isExecuting = false;
-				closeEventSource();
-				break;
-		}
-	}
+		return raw.map((step, index) => {
+			const data = (step && typeof step === 'object' ? step : {}) as Record<string, unknown>;
+
+			return {
+				agent_name: String(data.agent_name ?? data.agent ?? ''),
+				artifact: typeof data.artifact === 'string' ? data.artifact : null,
+				depends_on: Array.isArray(data.depends_on) ? (data.depends_on as string[]) : [],
+				id: String(data.id ?? `agency_${index}`),
+				phases: Array.isArray(data.phases) ? (data.phases as string[]) : undefined,
+				phase: typeof data.phase === 'string' ? data.phase : undefined,
+				status: 'pending' as AgencyPlanStatus,
+				subtask: String(data.subtask ?? '')
+			};
+		});
+	};
+
+	const applyPlan = (raw: unknown): void => {
+		const next = planFromSteps(raw);
+
+		if (!next.length) return;
+
+		const previous = new Map(agencyPlan.map((step) => [step.id, step.status]));
+
+		agencyPlan = next.map((step) => ({ ...step, status: previous.get(step.id) ?? step.status }));
+		agencyPlanRevision += 1;
+	};
+
+	/**
+	 * Paso del plan al que pertenece un evento. `step_start` trae `idx` (1-based)
+	 * y `agent_start`/`agent_end` traen `task_id`; si falta, se cae al agente que
+	 * esté en marcha para no perder el estado del paso.
+	 */
+	const planStepIdFor = (payload: Record<string, any>, agent: string): string | undefined => {
+		const explicit = payload.task_id ?? payload.id;
+
+		if (typeof explicit === 'string' && explicit) return explicit;
+
+		const idx = Number(payload.idx ?? 0);
+
+		if (idx > 0 && agencyPlan[idx - 1]) return agencyPlan[idx - 1].id;
+
+		return agencyPlan.find((step) => step.agent_name === agent && step.status === 'running')?.id;
+	};
+
+	const setPlanStepStatus = (
+		payload: Record<string, any>,
+		agent: string,
+		stepStatus: AgencyPlanStatus
+	): void => {
+		const id = planStepIdFor(payload, agent);
+
+		if (!id) return;
+
+		const index = agencyPlan.findIndex((step) => step.id === id);
+
+		if (index < 0 || agencyPlan[index].status === stepStatus) return;
+
+		const steps = [...agencyPlan];
+
+		steps[index] = { ...steps[index], status: stepStatus };
+		agencyPlan = steps;
+	};
 
 	function applyChatAgencyEvent(event: AgentEvent) {
-		if (event.job_id) currentJobId = event.job_id;
 		events = [...events, event];
 		if (event.type !== 'done' && event.type !== 'error') isExecuting = true;
 		const value = event.data ?? event.payload;
 		const valueObj = (value && typeof value === 'object' ? value : {}) as Record<string, any>;
 		const meta = (event.meta ?? {}) as Record<string, any>;
 		const agentName = typeof meta.agent === 'string' ? meta.agent : '';
-		const textValue =
-			typeof value === 'string' ? value : String(valueObj.text ?? '');
+		const textValue = typeof value === 'string' ? value : String(valueObj.text ?? '');
 
 		switch (event.type) {
 			case 'agency_selected': {
+				if (typeof valueObj.task === 'string') agencyGoal = valueObj.task;
 				status = {
 					...(status ?? { confidence: 0, memory: [], plan: null, skills: [], task: '' }),
 					confidence: 1,
 					mode: config.daemonMode ? 'DAEMON' : 'AGENCY',
 					task: ''
 				};
-				const steps = Array.isArray(valueObj.steps) ? valueObj.steps : [];
-				if (steps.length) {
-					agencyPlan = steps.map((step: any, index: number) => ({
-						id: String(step?.id ?? `agency_${index}`),
-						subtask: String(step?.subtask ?? ''),
-						agent_name: String(step?.agent_name ?? step?.agent ?? ''),
-						depends_on: Array.isArray(step?.depends_on) ? step.depends_on : []
-					}));
-					agencyPlanRevision += 1;
-				}
+				applyPlan(valueObj.steps);
 				break;
 			}
 			case 'plan': {
-				plan = value;
-				const steps = Array.isArray(valueObj.steps) ? valueObj.steps : [];
-				if (steps.length) {
-					agencyPlan = steps.map((step: any, index: number) => ({
-						id: String(step?.id ?? `agency_${index}`),
-						subtask: String(step?.subtask ?? ''),
-						agent_name: String(step?.agent_name ?? step?.agent ?? ''),
-						depends_on: Array.isArray(step?.depends_on) ? step.depends_on : []
-					}));
-					agencyPlanRevision += 1;
-				}
+				if (typeof valueObj.task === 'string') agencyGoal = valueObj.task;
+				// Replanificación (recuperación de un paso fallido) o plan inicial:
+				// `applyPlan` conserva el estado de los pasos que ya estaban hechos.
+				applyPlan(valueObj.steps);
 				break;
 			}
 			case 'step_start':
 				currentStep = String(valueObj.subtask ?? valueObj.agent ?? '');
+				setPlanStepStatus(valueObj, agentName, 'running');
 				break;
+			case 'step_end': {
+				// El paso terminó: `result` si produjo trabajo, `error` si no. Es el
+				// cierre de la fila del plan (y no existía como caso: el plan se
+				// quedaba en "pendiente" toda la ejecución).
+				const agent = String(valueObj.agent ?? agentName ?? '');
+				setPlanStepStatus(valueObj, agent, valueObj.error ? 'error' : 'done');
+				break;
+			}
 			case 'agent_start': {
 				const agent = String(valueObj.agent ?? agentName ?? 'agente');
 				const subtask = String(valueObj.subtask ?? '');
@@ -444,6 +512,7 @@ function createAgentStore() {
 						startedAt: Date.now()
 					}
 				];
+				setPlanStepStatus(valueObj, agent, 'running');
 				break;
 			}
 			case 'agent_end': {
@@ -451,7 +520,9 @@ function createAgentStore() {
 				const success = valueObj.success !== false;
 				const taskId = String(valueObj.task_id ?? '');
 				const index = agencyRuns.findIndex(
-					(run) => (taskId && run.id === taskId) || (!taskId && run.agent === agent && run.status === 'running')
+					(run) =>
+						(taskId && run.id === taskId) ||
+						(!taskId && run.agent === agent && run.status === 'running')
 				);
 				if (index >= 0) {
 					const runs = [...agencyRuns];
@@ -463,6 +534,7 @@ function createAgentStore() {
 					};
 					agencyRuns = runs;
 				}
+				setPlanStepStatus(valueObj, agent, success ? 'done' : 'error');
 				// FIX BUG SILENCIOSO: Verificar si hay más agentes activos antes de cerrar stream
 				const activeRuns = agencyRuns.filter((r) => r.status === 'running');
 				if (activeRuns.length === 0) {
@@ -531,6 +603,44 @@ function createAgentStore() {
 				};
 				break;
 			}
+			case 'incomplete': {
+				// El backend cierra la ejecución avisando de que no todos los pasos
+				// produjeron trabajo (paso cortado por la guarda, artefacto que no
+				// apareció, recuperación agotada). Es un AVISO: el `done` sin meta
+				// es lo que cierra el stream. Este evento no tenía case en NINGÚN
+				// switch, así que el usuario no veía nada.
+				agencyIncomplete = String(valueObj.reason ?? 'Plan incompleto');
+				if (typeof valueObj.agent === 'string' || agentName) {
+					setPlanStepStatus(valueObj, String(valueObj.agent ?? agentName), 'error');
+				}
+				break;
+			}
+			case 'tool_denied': {
+				// La whitelist del agente (`tool_policy`, backend) le negó una
+				// herramienta: el paso NO la ejecutó. Se marca en la tarjeta del
+				// agente que la pidió y queda el registro para el panel.
+				const deniedAgent = String(valueObj.agent ?? agentName ?? 'agente');
+				const deniedTool = String(valueObj.name ?? 'herramienta');
+
+				agencyDenials = [
+					...agencyDenials,
+					{ agent: deniedAgent, name: deniedTool, reason: String(valueObj.reason ?? '') }
+				];
+				const deniedIndex = agencyRuns.findIndex(
+					(run) => run.agent === deniedAgent && run.status === 'running'
+				);
+
+				if (deniedIndex >= 0) {
+					const runs = [...agencyRuns];
+
+					runs[deniedIndex] = {
+						...runs[deniedIndex],
+						denied: [...(runs[deniedIndex].denied ?? []), deniedTool]
+					};
+					agencyRuns = runs;
+				}
+				break;
+			}
 			case 'done':
 			case 'error': {
 				// Fallo puntual de un paso/subagente (lleva `agent` en el payload):
@@ -554,6 +664,20 @@ function createAgentStore() {
 						agencyRuns = runs;
 					}
 					break;
+				}
+				// El panel antiguo rellenaba la respuesta con el contenido del
+				// `done` cuando no había llegado texto. El chat recibe los `text`,
+				// pero el panel no debe quedarse vacío si el backend solo manda el
+				// resultado final.
+				if (event.type === 'done' && !response) {
+					const finalValue = valueObj.result ?? valueObj;
+
+					if (typeof finalValue === 'string') response = finalValue;
+					else if (finalValue && typeof finalValue === 'object') {
+						const content = (finalValue as { content?: unknown }).content;
+
+						if (typeof content === 'string') response = content;
+					}
 				}
 				status = {
 					...(status ?? { confidence: 0, memory: [], plan: null, skills: [], task: '' }),
@@ -579,90 +703,20 @@ function createAgentStore() {
 		}
 	}
 
-	function connectToJob(jobId: string) {
-		closeEventSource();
-		const source = new EventSource(`${config.endpoint.replace(/\/$/, '')}/agent_events/${jobId}`);
-		eventSource = source;
-		source.onopen = () => {
-			isConnected = true;
-			reconnectAttempt = 0;
-		};
-		/**
-		 * El navegador entrega el evento `error` NATIVO (caída o cierre del stream)
-		 * por el mismo canal que un evento SSE llamado "error", y un `Event` pelado
-		 * no trae `data`: parsearlo producía un falso "Evento SSE inválido" al
-		 * cerrarse la conexión.
-		 */
-		const parseEvent = (message: MessageEvent) => {
-			if (typeof message?.data !== 'string' || !message.data) return;
-			try {
-				applyEvent(JSON.parse(message.data) as AgentEvent);
-			} catch {
-				lastError = 'Evento SSE invalido';
-			}
-		};
-		source.onmessage = parseEvent;
-		for (const type of [
-			'text',
-			'reasoning',
-			'tool_call',
-			'native_tool_call',
-			'tool_result',
-			'step_start',
-			'step_end',
-			'plan',
-			'agency_selected',
-			'agent_start',
-			'agent_end',
-			'handoff',
-			'supervisor',
-					'progress',
-			'error',
-			'done'
-		]) {
-			source.addEventListener(type, (message) => parseEvent(message as MessageEvent));
-		}
-		source.onerror = () => {
-			isConnected = false;
-			closeEventSource();
-			if (isExecuting && currentJobId === jobId) {
-				const delay = Math.min(1000 * 2 ** reconnectAttempt++, 30000);
-				reconnectTimer = setTimeout(() => connectToJob(jobId), delay);
-			}
-		};
-	}
-
-	async function execute(
-		task: string,
-		context?: unknown,
-		agents = selectedAgencyAgents
-	): Promise<string> {
-		resetExecution();
-		isLoading = true;
-		isExecuting = true;
-		try {
-			// El modo investigación delega en el RAG real del chat (ragStore);
-			// solo enviamos la bandera para que el backend lo sepa.
-			const research = get(ragResearchMode);
-			const result = await fetch(`${config.endpoint.replace(/\/$/, '')}/agent_execute`, {
-				body: JSON.stringify({ agents, context, task, research }),
-				headers: { 'Content-Type': 'application/json' },
-				method: 'POST'
-			});
-			if (!result.ok) throw new Error(`Agent HTTP error: ${result.status}`);
-			const data = (await result.json()) as { job_id?: string };
-			if (!data.job_id) throw new Error('El agente no devolvio job_id');
-			currentJobId = data.job_id;
-			connectToJob(data.job_id);
-			return data.job_id;
-		} catch (error) {
-			lastError = error instanceof Error ? error.message : String(error);
-			isExecuting = false;
-			throw error;
-		} finally {
-			isLoading = false;
-		}
-	}
+	/**
+	 * El stream del job NO se abre aquí.
+	 *
+	 * El panel era un segundo dueño del `EventSource`: abría su propia conexión
+	 * con su propia lista de tipos (sin `usage`, sin `incomplete`, sin
+	 * `tool_denied`), su propia reconexión sin reanudar por índice y su propio
+	 * lanzamiento (`agent_execute`) que nadie usaba desde la UI. El mismo job se
+	 * veía distinto según quién escuchara y, al pasar el relevo al chat, había
+	 * que cerrar la conexión del panel y reconstruir la timeline desde cero.
+	 *
+	 * Ahora el dueño es el chat que lanza la tarea
+	 * (`chatStore.consumeAgencyJob`, sobre `$lib/utils/agency-stream`) y cada
+	 * frame llega aquí por `applyChatAgencyEvent`, el reductor único.
+	 */
 
 	async function fetchAgencyAgents(query = ''): Promise<AgencyAgent[]> {
 		try {
@@ -730,98 +784,6 @@ function createAgentStore() {
 		setSelectedAgencyAgents([]);
 	}
 
-	/**
-	 * Conversaciones cuyo stream agencial ya sigue el chat nativo.
-	 *
-	 * Un job solo debe tener UNA conexión SSE por pestaña: cuando el chat se
-	 * engancha a un job (envío nuevo o reanudación tras recargar), la marca evita
-	 * que el panel de agentes abra la suya y duplique eventos.
-	 */
-	/**
-	 * Conversación del job que sigue el EventSource propio del panel.
-	 *
-	 * El layout restaura jobs al montar y el chat se engancha después: este
-	 * vínculo permite que `claimAgencyJob` suelte la conexión del panel cuando
-	 * el chat pasa a ser el único consumidor del job.
-	 */
-	let currentJobConversationId: string | null = null;
-
-	const claimedAgencyConversations = new Set<string>();
-
-	/** Marca que el chat nativo sigue el job de esta conversación. */
-	function claimAgencyJob(conversationId: string): void {
-		claimedAgencyConversations.add(conversationId);
-
-		if (currentJobConversationId !== conversationId) return;
-
-		// El panel ya se había enganchado a este job (la restauración del layout
-		// monta antes que la página): se suelta su EventSource y se limpia la
-		// timeline para que la reconstruya el stream del chat desde el principio,
-		// con un solo consumidor y sin eventos duplicados.
-		if (reconnectTimer) clearTimeout(reconnectTimer);
-
-		reconnectTimer = null;
-		reconnectAttempt = 0;
-		closeEventSource();
-		currentJobId = null;
-		currentJobConversationId = null;
-		resetAgencyTimeline(conversationId);
-	}
-
-	/** True si el chat nativo ya sigue el job agencial de esta conversación. */
-	function isAgencyJobClaimed(conversationId: string): boolean {
-		return claimedAgencyConversations.has(conversationId);
-	}
-
-	/**
-	 * Reengancha la timeline del panel a un job que sigue vivo en el backend.
-	 *
-	 * Los jobs lanzados desde el chat (modo agencia) los sigue el propio chat
-	 * nativo, que alimenta esta timeline con `applyChatAgencyEvent` desde su
-	 * stream SSE: abrir aquí una segunda conexión duplicaría eventos, así que
-	 * esos jobs (reclamados con {@link claimAgencyJob}) se ignoran.
-	 */
-	async function restoreActiveJob(conversationId?: string | null): Promise<boolean> {
-		if (isExecuting || currentJobId) return false;
-		try {
-			const result = await requestAgent<{
-				jobs?: Array<{ conversation_id?: string | null; id?: string; status?: string }>;
-			}>(
-				config.endpoint,
-				conversationId
-					? `/agent_jobs?conversation_id=${encodeURIComponent(conversationId)}`
-					: '/agent_jobs'
-			);
-			const activeJob = result.jobs?.find(
-				(job) =>
-					job.status === 'running' &&
-					job.id &&
-					!(typeof job.conversation_id === 'string' && isAgencyJobClaimed(job.conversation_id))
-			);
-			if (!activeJob?.id) return false;
-			currentJobId = activeJob.id;
-			currentJobConversationId =
-				typeof activeJob.conversation_id === 'string' ? activeJob.conversation_id : null;
-			isExecuting = true;
-			connectToJob(activeJob.id);
-			return true;
-		} catch (error) {
-			lastError = error instanceof Error ? error.message : String(error);
-			return false;
-		}
-	}
-
-	async function cancel(): Promise<void> {
-		if (!currentJobId) return;
-		await fetch(`${config.endpoint.replace(/\/$/, '')}/agent_execute/${currentJobId}`, {
-			method: 'DELETE'
-		});
-		isExecuting = false;
-		closeEventSource();
-		currentJobId = null;
-		currentJobConversationId = null;
-	}
-
 	let config = $state<AgentConfig>(loadAgentConfig());
 
 	function updateConfig(patch: Partial<AgentConfig>) {
@@ -872,7 +834,12 @@ function createAgentStore() {
 					parallel?: boolean;
 				} | null;
 				daemon?: { is_running?: boolean; is_paused?: boolean; objective?: string | null };
-			}>(config.endpoint, conversationId ? `/agent_status?conversation_id=${encodeURIComponent(conversationId)}` : '/agent_status');
+			}>(
+				config.endpoint,
+				conversationId
+					? `/agent_status?conversation_id=${encodeURIComponent(conversationId)}`
+					: '/agent_status'
+			);
 			const daemon = result.daemon;
 			if (result && typeof result === 'object') {
 				const newStatus: AgentStatus = {
@@ -943,12 +910,16 @@ function createAgentStore() {
 		try {
 			const result = await requestAgent<{ active_plan?: any }>(
 				config.endpoint,
-				conversationId ? `/agent_plan?conversation_id=${encodeURIComponent(conversationId)}` : '/agent_plan'
+				conversationId
+					? `/agent_plan?conversation_id=${encodeURIComponent(conversationId)}`
+					: '/agent_plan'
 			);
 			if (result && typeof result === 'object') {
-				plan = result.active_plan ?? null;
+				// El plan VIVO es `agencyPlan` (lo alimenta el reductor con los
+				// eventos del stream). Este endpoint es de solo lectura: devuelve el
+				// plan persistido sin pisar la timeline en curso.
 				lastError = null;
-				return plan;
+				return result.active_plan ?? null;
 			}
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
@@ -1114,10 +1085,7 @@ function createAgentStore() {
 	function buildContextBlock(): string | null {
 		if (!config.agentMode) return null;
 		const selected = agencyAgents.filter((a) => selectedAgencyAgents.includes(a.name));
-		const autoAgents =
-			config.selectionMode !== 'manual'
-				? agencyAgents.slice(0, 12)
-				: [];
+		const autoAgents = config.selectionMode !== 'manual' ? agencyAgents.slice(0, 12) : [];
 		const lines: string[] = [];
 		if (selected.length || autoAgents.length) {
 			lines.push('## Modo agente (AGENCY) activo');
@@ -1167,6 +1135,9 @@ function createAgentStore() {
 		get agencyPlan() {
 			return agencyPlan;
 		},
+		get agencyGoal() {
+			return agencyGoal;
+		},
 		get agencyPlanRevision() {
 			return agencyPlanRevision;
 		},
@@ -1185,11 +1156,14 @@ function createAgentStore() {
 		get agencyProgress() {
 			return agencyProgress;
 		},
+		get agencyIncomplete() {
+			return agencyIncomplete;
+		},
+		get agencyDenials() {
+			return agencyDenials;
+		},
 		get config() {
 			return config;
-		},
-		get currentJobId() {
-			return currentJobId;
 		},
 		get events() {
 			return events;
@@ -1242,9 +1216,6 @@ function createAgentStore() {
 		get memory() {
 			return memory;
 		},
-		get plan() {
-			return plan;
-		},
 		get skills() {
 			return skills;
 		},
@@ -1255,8 +1226,6 @@ function createAgentStore() {
 		fetchPlan,
 		fetchSkills,
 		fetchStatus,
-		cancel,
-		execute,
 		fetchCheckpoints,
 		fetchDaemonTasks,
 		fetchAgencyAgents,
@@ -1265,9 +1234,6 @@ function createAgentStore() {
 		saveAgent,
 		deleteAgent,
 		fetchSensors,
-		restoreActiveJob,
-		claimAgencyJob,
-		isAgencyJobClaimed,
 		pause,
 		refreshAll,
 		resume,

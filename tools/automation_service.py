@@ -1,25 +1,23 @@
-"""Servicio de automatización 24/7 **independiente** (puerto 15001).
+"""Servicio de automatización 24/7 (puerto 15001).
 
-Este proceso es el corazón de la autonomía: vive fuera del Manager y fuera de
-`dev_agent`, así que la automatización sigue funcionando aunque el Manager esté
-cerrado o el agente HTTP no se haya arrancado. Solo muere cuando el sistema se
-apaga o el usuario lo detiene.
+Este proceso es el corazón de la autonomía: mantiene el **dispatcher** (cola
+persistente + pool de workers + janitor), el listener IMAP y la ingesta de
+webhooks, y expone la API HTTP que consume la pestaña de automatización de la
+UI nativa. La UI **no** ejecuta nada por sí misma: todo el trabajo vive aquí.
 
-Responsabilidades:
-
-1. Arrancar el **dispatcher** (cola persistente + pool de workers + janitor).
-2. Arrancar el **listener IMAP** (si hay configuración) que alimenta la cola.
-3. Exponer una **API HTTP** para que la pestaña de automatización de la UI nativa
-   de llama.cpp consulte estado, tareas, aprobaciones, auditoría y dispatchers.
-4. Servir la **ingesta de webhooks** (`POST /webhook/<nombre>`): cualquier sistema
-   externo convierte su evento en una tarea sin conocer el token global.
-
-Arranque manual:
+Vive en su propio proceso para sobrevivir al cierre de la **web view** (el
+visor y el panel solo son clientes HTTP), pero es hijo del **manager**: lo
+arranca `tools/automation_process.py` desde la secuencia de servicios del
+manager y muere con él, porque sin manager no hay modelo cargado y sin modelo
+ningún dispatcher tendría algo que ejecutar. Arrancarlo a mano seguiría
+funcionando, pero entonces la automatización queda sin modelo:
 
     python -m tools.automation_service                # 127.0.0.1:15001
     python tools/automation_service.py --port 15001   # ejecución suelta
 
-La UI **no** ejecuta nada por sí misma: todo el trabajo vive aquí.
+Si el manager se cierra de golpe (kill, cierre forzado) el proceso no se
+enteraría: por eso acepta `--parent-pid PID` y un watchdog lo cierra cuando su
+padre desaparece.
 """
 
 from __future__ import annotations
@@ -30,6 +28,8 @@ import logging
 import os
 import signal
 import sys
+import threading
+import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from flask import Flask, Response, jsonify, request
@@ -52,10 +52,67 @@ except ImportError:  # pragma: no cover - ejecución suelta (python tools/automa
 DEFAULT_HOST = os.environ.get("AUTOMATION_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("AUTOMATION_PORT", "15001"))
 DEFAULT_WORKSPACE = os.environ.get("AUTOMATION_WORKSPACE", "")
+DEFAULT_PARENT_PID = int(os.environ.get("AUTOMATION_PARENT_PID", "0") or 0)
 
 logger = logging.getLogger("automation_service")
 
 _rate_limiter = get_rate_limiter(limit=240, window_seconds=60)
+
+
+# ----------------------------------------------------------------------------
+# Vigilancia del manager que arrancó este servicio
+# ----------------------------------------------------------------------------
+def process_started_at(pid: int) -> Optional[float]:
+    """Hora de arranque de un PID (o None si el proceso ya no existe)."""
+    try:
+        import psutil
+
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:
+        return None
+
+
+def parent_alive(pid: int, expected_started_at: Optional[float] = None) -> bool:
+    """¿Sigue vivo el manager que arrancó este servicio?
+
+    Sin `pid` no se vigila nada (arranque manual). Si `psutil` no está —o no
+    puede abrir el proceso— se cae a la sonda mínima `os.kill(pid, 0)`.
+
+    La hora de arranque evita el falso positivo clásico: el manager murió, el
+    sistema reutilizó su número de PID para otro proceso y el watchdog creería
+    que sigue ahí. Si no coincide, el padre es otro.
+    """
+    try:
+        number = int(pid or 0)
+    except (TypeError, ValueError):
+        return True
+
+    if number <= 0:
+        return True
+
+    try:
+        import psutil
+    except Exception:
+        psutil = None  # type: ignore[assignment]
+
+    if psutil is not None:
+        try:
+            proc = psutil.Process(number)
+            if not proc.is_running():
+                return False
+            if expected_started_at is not None:
+                return abs(proc.create_time() - float(expected_started_at)) <= 0.5
+            return True
+        except Exception:
+            return False
+
+    try:  # pragma: no cover - solo si falta psutil
+        os.kill(number, 0)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return True
 
 
 # ----------------------------------------------------------------------------
@@ -69,6 +126,12 @@ def get_dispatcher():
 
 def get_imap_listener():
     from .imap_listener import get_imap_listener as _get
+
+    return _get()
+
+
+def get_gmail_listener():
+    from .gmail_listener import get_gmail_listener as _get
 
     return _get()
 
@@ -292,6 +355,7 @@ def create_app() -> Flask:
             payload: Dict[str, Any] = {"success": True, "dispatcher": get_dispatcher().status()}
             for key, provider in (
                 ("imap", get_imap_listener),
+                ("gmail", get_gmail_listener),
                 ("webhooks", get_webhook_dispatcher),
                 ("filewatches", get_filewatch_dispatcher),
                 ("crons", get_cron_dispatcher),
@@ -715,7 +779,231 @@ def create_app() -> Flask:
     )
     _register_registry(app, "crons", get_cron_dispatcher, runner=_cron_run, runner_action="run")
 
+    # ------------------------------------------------------------------ Gmail
+    @app.route("/automation/gmail/config", methods=["GET", "PUT", "OPTIONS"])
+    def automation_gmail_config():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        denied = _guard()
+        if denied:
+            return denied
+        from .google_mail import public_config, save_google_defaults
+
+        if request.method == "GET":
+            return _json_response({"success": True, "config": public_config()})
+        data = request.get_json(silent=True) or {}
+        enabled = data.get("enabled")
+        mark_seen = data.get("mark_seen")
+        if not isinstance(enabled, bool) or not isinstance(mark_seen, bool):
+            return _json_response({"success": False, "error": "enabled y mark_seen deben ser booleanos"}, 400)
+        current = public_config()
+        if enabled and not current["connected"]:
+            return _json_response({"success": False, "error": "Vincula primero una cuenta Google"}, 409)
+        try:
+            poll_interval = int(data.get("poll_interval", current["poll_interval"]))
+            max_per_poll = int(data.get("max_per_poll", current["max_per_poll"]))
+            if not 5 <= poll_interval <= 86400:
+                raise ValueError("El intervalo debe estar entre 5 y 86400 segundos")
+            if not 1 <= max_per_poll <= 1000:
+                raise ValueError("El máximo por sondeo debe estar entre 1 y 1000")
+            save_google_defaults({
+                "gmail_enabled": enabled,
+                "gmail_search": str(data.get("search", current["search"]) or "is:unread").strip(),
+                "gmail_poll_interval": poll_interval,
+                "gmail_mark_seen": mark_seen,
+                "gmail_max_per_poll": max_per_poll,
+                "gmail_wake_prompt": str(data.get("wake_prompt", current["wake_prompt"]) or ""),
+                "gmail_agent_template": str(data.get("agent_template", current["agent_template"]) or ""),
+            })
+            listener = get_gmail_listener()
+            if enabled:
+                listener.start()
+            else:
+                listener.stop()
+            return _json_response({"success": True, "config": public_config()})
+        except (TypeError, ValueError) as exc:
+            return _json_response({"success": False, "error": str(exc)}, 400)
+
+    @app.route("/automation/gmail/oauth/start", methods=["POST", "OPTIONS"])
+    def automation_gmail_oauth_start():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        denied = _guard()
+        if denied:
+            return denied
+        from .google_mail import begin_authorization
+
+        data = request.get_json(silent=True) or {}
+        try:
+            return _json_response({"success": True, **begin_authorization(
+                str(data.get("client_id") or ""), str(data.get("client_secret") or "")
+            )})
+        except ValueError as exc:
+            return _json_response({"success": False, "error": str(exc)}, 400)
+        except Exception as exc:
+            logger.exception("No se pudo iniciar OAuth de Google")
+            return _json_response({"success": False, "error": str(exc)}, 502)
+
+    @app.route("/automation/gmail/oauth/callback", methods=["GET", "OPTIONS"])
+    def automation_gmail_oauth_callback():
+        from html import escape
+        from .google_mail import complete_authorization
+
+        if request.method == "OPTIONS":
+            return ("", 204)
+        if request.args.get("error"):
+            message = "Google canceló o rechazó la autorización. Puedes cerrar esta pestaña."
+            return Response(f"<!doctype html><meta charset=utf-8><title>Gmail</title><p>{escape(message)}</p>", status=400, mimetype="text/html")
+        try:
+            result = complete_authorization(
+                request.args.get("code", ""), request.args.get("state", "")
+            )
+            message = f"Cuenta Gmail vinculada: {result.get('email') or 'Google'}. Puedes cerrar esta pestaña y volver a Llama Server Manager."
+            get_gmail_listener().start()
+            return Response(f"<!doctype html><meta charset=utf-8><title>Gmail conectado</title><p>{escape(message)}</p>", mimetype="text/html")
+        except Exception as exc:
+            logger.exception("Falló el callback OAuth de Gmail")
+            return Response(f"<!doctype html><meta charset=utf-8><title>Error de Gmail</title><p>{escape(str(exc))}</p>", status=400, mimetype="text/html")
+
+    @app.route("/automation/gmail/disconnect", methods=["POST", "OPTIONS"])
+    def automation_gmail_disconnect():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        denied = _guard()
+        if denied:
+            return denied
+        from .google_mail import disconnect, public_config
+
+        get_gmail_listener().stop()
+        disconnect()
+        return _json_response({"success": True, "config": public_config()})
+
+    @app.route("/automation/gmail/poll", methods=["POST", "OPTIONS"])
+    def automation_gmail_poll():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        denied = _guard()
+        if denied:
+            return denied
+        listener = get_gmail_listener()
+        try:
+            result = listener.poll_once()
+            return _json_response({"success": True, **result})
+        except Exception as exc:
+            return _json_response({"success": False, "error": str(exc)}, 502)
+
     # ------------------------------------------------------------------ IMAP
+    @app.route("/automation/imap/config", methods=["GET", "PUT", "OPTIONS"])
+    def automation_imap_config():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        denied = _guard()
+        if denied:
+            return denied
+
+        try:
+            from .imap_listener import save_imap_defaults
+        except ImportError:  # ejecución directa como script
+            from tools.imap_listener import save_imap_defaults
+
+        listener = get_imap_listener()
+        if request.method == "GET":
+            config = listener.config
+        else:
+            data = request.get_json(silent=True) or {}
+            current = listener.config
+            try:
+                host = str(data.get("host", current.host) or "").strip()
+                user = str(data.get("user", current.user) or "").strip()
+                enabled = data.get("enabled", current.enabled)
+                use_ssl = data.get("use_ssl", current.use_ssl)
+                mark_seen = data.get("mark_seen", current.mark_seen)
+                for name, value in (("enabled", enabled), ("use_ssl", use_ssl), ("mark_seen", mark_seen)):
+                    if not isinstance(value, bool):
+                        raise ValueError(f"'{name}' debe ser booleano")
+                port = int(data.get("port", current.port))
+                poll_interval = float(data.get("poll_interval", current.poll_interval))
+                max_per_poll = int(data.get("max_per_poll", current.max_per_poll))
+                if not 1 <= port <= 65535:
+                    raise ValueError("El puerto debe estar entre 1 y 65535")
+                if not 5 <= poll_interval <= 86400:
+                    raise ValueError("El intervalo debe estar entre 5 y 86400 segundos")
+                if not 1 <= max_per_poll <= 1000:
+                    raise ValueError("El máximo por sondeo debe estar entre 1 y 1000")
+                password = data.get("password")
+                if password is not None and not isinstance(password, str):
+                    raise ValueError("La contraseña debe ser texto")
+                effective_password = password if password else current.password
+                if enabled and not (host and user and effective_password):
+                    raise ValueError("Para activar IMAP se requiere servidor, usuario y contraseña")
+
+                updates = {
+                    "imap_enabled": enabled,
+                    "imap_host": host,
+                    "imap_port": port,
+                    "imap_user": user,
+                    "imap_use_ssl": use_ssl,
+                    "imap_folder": str(data.get("folder", current.folder) or "INBOX").strip(),
+                    "imap_search": str(data.get("search", current.search) or "UNSEEN").strip(),
+                    "imap_poll_interval": poll_interval,
+                    "imap_mark_seen": mark_seen,
+                    "imap_max_per_poll": max_per_poll,
+                    "imap_wake_prompt": str(data.get("wake_prompt", current.wake_prompt) or ""),
+                    "imap_agent_template": str(data.get("agent_template", current.agent_template) or ""),
+                }
+                if password:
+                    updates["imap_password"] = password
+
+                was_running = listener.is_running
+                if was_running:
+                    listener.stop()
+                config = save_imap_defaults(updates)
+                listener.config = config
+                if config.enabled:
+                    listener.start()
+            except (TypeError, ValueError) as exc:
+                return _json_response({"success": False, "error": str(exc)}, 400)
+            except Exception as exc:
+                logger.exception("No se pudo guardar la configuración IMAP")
+                return _json_response({"success": False, "error": str(exc)}, 500)
+
+        return _json_response({
+            "success": True,
+            "config": {
+                "enabled": config.enabled,
+                "host": config.host,
+                "port": config.port,
+                "user": config.user,
+                "has_password": bool(config.password),
+                "use_ssl": config.use_ssl,
+                "folder": config.folder,
+                "search": config.search,
+                "poll_interval": config.poll_interval,
+                "mark_seen": config.mark_seen,
+                "max_per_poll": config.max_per_poll,
+                "wake_prompt": config.wake_prompt,
+                "agent_template": config.agent_template,
+                "configured": config.configured,
+                "running": listener.is_running,
+            },
+        })
+
+    @app.route("/automation/imap/test", methods=["POST", "OPTIONS"])
+    def automation_imap_test():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        denied = _guard()
+        if denied:
+            return denied
+        listener = get_imap_listener()
+        if not listener.config.configured:
+            return _json_response(
+                {"success": False, "error": "Configura servidor, usuario y contraseña antes de probar"},
+                400,
+            )
+        result = listener.test_connection()
+        return _json_response(result, 200 if result.get("success") else 502)
+
     @app.route("/automation/imap/status", methods=["GET", "OPTIONS"])
     def automation_imap_status():
         if request.method == "OPTIONS":
@@ -755,10 +1043,19 @@ def create_app() -> Flask:
 class AutomationService:
     """Arranca el dispatcher + listener y sirve la API HTTP."""
 
-    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, with_imap: bool = True):
+    def __init__(
+        self,
+        host: str = DEFAULT_HOST,
+        port: int = DEFAULT_PORT,
+        with_imap: bool = True,
+        parent_pid: int = DEFAULT_PARENT_PID,
+    ):
         self.host = host
         self.port = int(port)
         self.with_imap = bool(with_imap)
+        # PID del manager que nos arrancó: si desaparece, la automatización
+        # queda sin modelo y no tiene sentido seguir viva.
+        self.parent_pid = int(parent_pid or 0)
         self._stopped = False
         self._started = False
 
@@ -784,6 +1081,11 @@ class AutomationService:
                 logger.info("Listener IMAP iniciado")
             except Exception as exc:
                 logger.warning(f"Listener IMAP no iniciado: {exc}")
+        try:
+            get_gmail_listener().start()
+            logger.info("Listener Gmail iniciado si hay una cuenta vinculada y activa")
+        except Exception as exc:
+            logger.warning(f"Listener Gmail no iniciado: {exc}")
 
     def stop_backends(self) -> None:
         if self._stopped:
@@ -808,10 +1110,38 @@ class AutomationService:
                 get_imap_listener().stop()
             except Exception as exc:  # pragma: no cover
                 logger.debug(f"No se pudo detener el listener IMAP: {exc}")
+        try:
+            get_gmail_listener().stop()
+        except Exception as exc:  # pragma: no cover
+            logger.debug(f"No se pudo detener el listener Gmail: {exc}")
         logger.info("Servicio de automatización detenido")
+
+    def _watch_parent(self, interval: float = 5.0) -> None:
+        """Cierra el servicio cuando el manager que lo arrancó desaparece.
+
+        Cubre el cierre brusco del manager (kill, fin de tarea forzado): el
+        dispatcher no debe quedar huérfano ejecutando tareas sin modelo.
+        """
+        if self.parent_pid <= 0:
+            return
+
+        expected = process_started_at(self.parent_pid)
+        logger.info("Vigilando al manager (PID %s)", self.parent_pid)
+
+        while not self._stopped:
+            if not parent_alive(self.parent_pid, expected):
+                logger.warning(
+                    "El manager (PID %s) ya no existe: cerrando el servicio de automatización",
+                    self.parent_pid,
+                )
+                self.stop_backends()
+                os._exit(0)
+            time.sleep(interval)
 
     def run(self) -> None:
         self.start_backends()
+        if self.parent_pid > 0:
+            threading.Thread(target=self._watch_parent, daemon=True, name="parent-watchdog").start()
         app = create_app()
         logger.info(f"API del servicio en http://{self.host}:{self.port}")
         app.run(host=self.host, port=self.port, threaded=True, use_reloader=False)
@@ -823,6 +1153,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--workspace", default=DEFAULT_WORKSPACE, help="Workspace que vigila el agente")
     parser.add_argument("--no-imap", action="store_true", help="No arrancar el listener IMAP")
+    parser.add_argument(
+        "--parent-pid",
+        type=int,
+        default=DEFAULT_PARENT_PID,
+        help="PID del manager que arranca el servicio (el watchdog lo cierra cuando desaparece)",
+    )
     return parser
 
 
@@ -838,7 +1174,12 @@ def main(argv: Optional[list] = None) -> int:
     if args.workspace:
         DEFAULT_WORKSPACE = args.workspace
 
-    service = AutomationService(host=args.host, port=args.port, with_imap=not args.no_imap)
+    service = AutomationService(
+        host=args.host,
+        port=args.port,
+        with_imap=not args.no_imap,
+        parent_pid=args.parent_pid,
+    )
 
     def _handle_signal(signum, _frame):
         logger.info(f"Señal {signum} recibida; cerrando el servicio…")

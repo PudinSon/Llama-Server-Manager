@@ -61,6 +61,22 @@ DEFAULT_POLL_INTERVAL = 60.0
 DEFAULT_MAX_PER_POLL = 10
 MAX_BODY_CHARS = 4000
 SOURCE_NAME = "imap"
+_IMAP_CONFIG_LOCK = threading.Lock()
+IMAP_CONFIG_FIELDS = {
+    "imap_enabled",
+    "imap_host",
+    "imap_port",
+    "imap_user",
+    "imap_password",
+    "imap_use_ssl",
+    "imap_folder",
+    "imap_search",
+    "imap_poll_interval",
+    "imap_mark_seen",
+    "imap_max_per_poll",
+    "imap_wake_prompt",
+    "imap_agent_template",
+}
 
 
 # ============================================================================
@@ -134,6 +150,39 @@ def _settings_defaults() -> Dict[str, Any]:
         return {}
     defaults = data.get("defaults")
     return defaults if isinstance(defaults, dict) else data
+
+
+def save_imap_defaults(updates: Dict[str, Any]) -> ImapConfig:
+    """Persiste solo campos IMAP y devuelve la configuración efectiva."""
+    import json
+
+    unknown = set(updates) - IMAP_CONFIG_FIELDS
+    if unknown:
+        raise ValueError(f"campos IMAP no permitidos: {', '.join(sorted(unknown))}")
+
+    path = Path(runtime.get_user_data_dir()) / "config.json"
+    with _IMAP_CONFIG_LOCK:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"no se pudo leer config.json: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError("config.json debe contener un objeto JSON")
+
+        defaults = data.get("defaults")
+        if not isinstance(defaults, dict):
+            defaults = {}
+            data["defaults"] = defaults
+        defaults.update(updates)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        temporary.replace(path)
+
+    return load_imap_config(defaults)
 
 
 # ============================================================================
@@ -259,6 +308,9 @@ class ImapListener:
     def start(self) -> "ImapListener":
         if self.is_running:
             return self
+        if not self.config.enabled:
+            logger.info("📧 Listener IMAP inactivo: imap_enabled está desactivado")
+            return self
         if not self.config.configured:
             logger.info(
                 "📧 Listener IMAP inactivo: faltan imap_host/imap_user/imap_password en la configuración"
@@ -318,6 +370,28 @@ class ImapListener:
         except Exception as exc:
             logger.error(f"Error en el sondeo manual: {exc}")
             return None
+
+    async def test_connection_once(self) -> Dict[str, Any]:
+        """Autentica y abre la carpeta configurada sin consumir mensajes."""
+        client = await self._create_client()
+        try:
+            response = await client.select(self.config.folder)
+            result = getattr(response, "result", "OK")
+            if result != "OK":
+                raise RuntimeError(f"No se pudo abrir la carpeta IMAP {self.config.folder}: {result}")
+            return {"success": True, "folder": self.config.folder}
+        finally:
+            try:
+                await client.logout()
+            except Exception:
+                pass
+
+    def test_connection(self) -> Dict[str, Any]:
+        """Prueba la conexión desde la API síncrona del servicio Flask."""
+        try:
+            return asyncio.run(self.test_connection_once())
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
 
     # ------------------------------------------------------------------
     # Sondeo

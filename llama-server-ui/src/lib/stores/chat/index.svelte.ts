@@ -51,6 +51,11 @@ import {
 	isAbortError,
 	normalizeModelName
 } from '$lib/utils';
+import {
+	AGENCY_RECONNECT_MAX_ATTEMPTS,
+	type AgencySseFrame,
+	streamAgencyJob
+} from '$lib/utils/agency-stream';
 import { SvelteMap } from 'svelte/reactivity';
 
 /**
@@ -75,15 +80,6 @@ function authHeaders(): Record<string, string> {
  */
 const AGENCY_FLUSH_INTERVAL_MS = 700;
 
-/** Espera inicial entre reintentos del SSE agencial (se duplica por intento). */
-const AGENCY_RECONNECT_BASE_DELAY_MS = 750;
-
-/** Tope de espera entre reintentos del SSE agencial. */
-const AGENCY_RECONNECT_MAX_DELAY_MS = 30_000;
-
-/** Reintentos de reconexión del SSE agencial antes de dar el stream por perdido. */
-const AGENCY_RECONNECT_MAX_ATTEMPTS = 24;
-
 /** Estado vivo de una ejecución agencial que el chat está siguiendo. */
 interface AgencyChatRun {
 	/** Índice del último evento aplicado: base del resume tras reconectar. */
@@ -105,15 +101,6 @@ interface AgencyTurnState {
 	/** Texto acumulado de todo el job (título de la conversación). */
 	text: string;
 	timings?: ChatMessageTimings;
-}
-
-/** Marco SSE crudo del job agencial (`event: <tipo>` + `data: {...}`). */
-interface AgencySseFrame {
-	/** Índice absoluto de la cola del job (lo incrusta el backend). */
-	index?: number;
-	meta?: Record<string, unknown>;
-	payload?: unknown;
-	type?: string;
 }
 
 class ChatStore implements ChatStreamHost, ChatFlowsHost {
@@ -1328,6 +1315,21 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				firstUserMessageContent ||
 				allMessages.findLast((message) => message.role === MessageRole.USER)?.content?.toString() ||
 				'';
+			const conversationHistory = allMessages
+				.filter(
+					(message) =>
+						(message.role === MessageRole.USER || message.role === MessageRole.ASSISTANT) &&
+						typeof message.content === 'string' &&
+						message.content.trim()
+				)
+				.map((message) => ({ content: message.content as string, role: message.role }));
+
+			if (
+				conversationHistory.at(-1)?.role === MessageRole.USER &&
+				conversationHistory.at(-1)?.content === task
+			) {
+				conversationHistory.pop();
+			}
 
 			if (task.trim()) {
 				// El flujo de agencia escribe sus propios turnos (un bloque por
@@ -1339,6 +1341,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				try {
 					await this.streamSelectedAgencyTask(
 						task,
+						{ conversation_history: conversationHistory.slice(-8) },
 						agentStore.selectedAgencyAgents,
 						writer.callbacks,
 						abortController.signal,
@@ -1657,6 +1660,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	 */
 	private async streamSelectedAgencyTask(
 		task: string,
+		context: Record<string, unknown>,
 		agents: string[],
 		callbacks: ChatStreamCallbacks,
 		signal: AbortSignal,
@@ -1673,6 +1677,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		const response = await fetch(`${endpoint}/agent_execute`, {
 			body: JSON.stringify({
 				agents,
+				context,
 				// El id permite al backend deduplicar por conversación y localizar el
 				// job activo con `GET /agent_jobs?conversation_id=...`.
 				conversation_id: conversationId ?? undefined,
@@ -1703,9 +1708,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		if (conversationId) {
 			this.agencyRuns.set(conversationId, run);
-			// El chat asume el stream del job: la timeline del panel se alimenta
-			// desde aquí y el panel no debe abrir un EventSource que compita.
-			agentStore.claimAgencyJob(conversationId);
 		}
 
 		agentStore.applyChatAgencyEvent({ job_id: jobId, type: 'step_start' });
@@ -1750,6 +1752,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		let step: AgencyStepMeta | null = null;
 		/** Ids del plan por índice: `step_start` no los manda, `agency_selected` sí. */
 		const planStepIds: string[] = [];
+		const planStepsById = new SvelteMap<string, Record<string, unknown>>();
 		// Totales del job: cada `usage` (especialista o supervisor) suma aquí, y
 		// es lo que se persiste y se renderiza como métricas del mensaje final.
 		let usageTotals: ChatMessageTimings = {
@@ -1780,11 +1783,14 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			if (!steps.length) return;
 
 			planStepIds.length = 0;
+			planStepsById.clear();
 
 			steps.forEach((item, index) => {
 				const data = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
 
-				planStepIds[index] = String(data.id ?? data.task_id ?? `agency_${index}`);
+				const id = String(data.id ?? data.task_id ?? `agency_${index}`);
+				planStepIds[index] = id;
+				planStepsById.set(id, data);
 			});
 		};
 
@@ -1807,14 +1813,19 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			const agent = String(payload.agent ?? 'agente');
 			const subtask = String(payload.subtask ?? '');
 			const taskId = resolveStepId(payload);
+			const planStep = taskId ? planStepsById.get(taskId) : undefined;
 			const total = Number(payload.total ?? planStepIds.length ?? 0);
 			const index = taskId ? planStepIds.indexOf(taskId) + 1 : Number(payload.idx ?? 0);
-			const label =
-				index > 0 && total > 0 ? `▶ ${agent} · paso ${index}/${total}` : `▶ ${agent}`;
+			const label = index > 0 && total > 0 ? `▶ ${agent} · paso ${index}/${total}` : `▶ ${agent}`;
 
 			return {
 				agent,
 				label,
+				phases: Array.isArray(planStep?.phases)
+					? planStep.phases.map(String)
+					: typeof planStep?.phase === 'string'
+						? [planStep.phase]
+						: undefined,
 				role: 'specialist',
 				subtask: subtask || undefined,
 				task_id: taskId
@@ -1888,431 +1899,275 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			if (message) state.messageId = message.id;
 		};
 
-		await new Promise<void>((resolve, reject) => {
-			let settled = false;
-			let serverDone = false;
-			let malformedFrames = 0;
-			let source: EventSource | null = null;
-			let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-			let reconnectAttempt = 0;
-			/**
-			 * Base del índice de la conexión actual. `?from=N` ahorra el replay
-			 * completo; si el backend no lo soporta manda `sse_start` con from=0
-			 * y el cliente descarta lo ya aplicado comparando índices.
-			 */
-			let baseIndex = run.appliedIndex;
-			let receivedOnConnection = 0;
-			let connect: () => void = () => {};
+		/**
+		 * Traducción frame → mensajes del chat. El transporte (índices,
+		 * reanudación, reintentos, frames corruptos y fin del job) vive en
+		 * `$lib/utils/agency-stream`; aquí solo se decide qué se ve.
+		 */
+		const translateFrame = async (frame: AgencySseFrame): Promise<void> => {
+			const payload = frame.payload as Record<string, unknown> | string | undefined;
+			const payloadObj = (payload && typeof payload === 'object' ? payload : {}) as Record<
+				string,
+				unknown
+			>;
+			const meta = frame.meta ?? {};
+			const fromSpecialist = meta.role === 'specialist';
 
-			/**
-			 * Corta el job en el BACKEND. Sin esto, el botón de parar nativo solo
-			 * cerraba el EventSource: el orquestador y los agentes seguían
-			 * trabajando (y el modelo generando) hasta terminar.
-			 */
-			const cancelAgencyJob = () => {
-				void fetch(`${endpoint}/agent_execute/${jobId}`, {
-					headers: { ...authHeaders() },
-					method: 'DELETE'
-				}).catch(() => {
-					// La cancelación es best-effort: el job ya puede haber terminado.
-				});
-			};
-
-			const teardown = () => {
-				if (reconnectTimer) clearTimeout(reconnectTimer);
-
-				reconnectTimer = null;
-				source?.close();
-				source = null;
-			};
-
-			const onAbort = () => {
-				cancelAgencyJob();
-				settle(new DOMException('Aborted', 'AbortError'));
-			};
-
-			function settle(error?: Error): void {
-				if (settled) return;
-
-				settled = true;
-				teardown();
-				signal.removeEventListener('abort', onAbort);
-
-				if (error) reject(error);
-				else resolve();
-			}
-
-			/**
-			 * Reenganche con backoff. El job sigue vivo en el backend, así que el
-			 * stream se reintenta en lugar de dar la ejecución por perdida: es el
-			 * caso de los tools largos (minutos sin emitir eventos) y de los
-			 * proxies intermedios que cortan conexiones SSE ociosas.
-			 */
-			const scheduleReconnect = () => {
-				if (settled || serverDone || signal.aborted) return;
-
-				if (reconnectAttempt >= AGENCY_RECONNECT_MAX_ATTEMPTS) {
-					cancelAgencyJob();
-					settle(new Error('Conexion SSE del agente perdida'));
-
-					return;
-				}
-
-				const delay = Math.min(
-					AGENCY_RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempt,
-					AGENCY_RECONNECT_MAX_DELAY_MS
-				);
-
-				reconnectAttempt += 1;
-				console.warn(
-					`[agency] stream SSE caido; reintento ${reconnectAttempt}/${AGENCY_RECONNECT_MAX_ATTEMPTS} en ${delay}ms`
-				);
-				reconnectTimer = setTimeout(() => {
-					reconnectTimer = null;
-					connect();
-				}, delay);
-			};
-
-			connect = () => {
-				if (settled || serverDone || signal.aborted) return;
-
-				baseIndex = run.appliedIndex;
-				receivedOnConnection = 0;
-
-				const next = new EventSource(`${endpoint}/agent_events/${jobId}?from=${baseIndex}`);
-
-				source = next;
-				next.onopen = () => {
-					reconnectAttempt = 0;
-				};
-
-				const handle = async (message: MessageEvent) => {
-					// Los comentarios `: keepalive` del backend llegan sin `data`:
-					// no son eventos del job y no consumen índice.
-					if (typeof message?.data !== 'string' || !message.data) return;
-
-					// Todo frame con datos ocupa su hueco en la cola del job (los
-					// corruptos también), así que el índice avanza antes de parsear.
-					const index = baseIndex + receivedOnConnection;
-
-					receivedOnConnection += 1;
-
-					let frame: AgencySseFrame;
-
-					try {
-						frame = JSON.parse(message.data) as AgencySseFrame;
-					} catch {
-						// Un frame corrupto no debe matar una ejecución de varios
-						// minutos: solo se aborta si el stream deja de ser JSON.
-						malformedFrames += 1;
-						console.warn('[agency] Evento SSE no parseable', message.data.slice(0, 200));
-
-						if (malformedFrames >= 3) settle(new Error('Evento de agente invalido'));
-
-						return;
+			try {
+				switch (frame.type) {
+					case 'agency_selected': {
+						recordPlanSteps(payloadObj.steps);
+						await switchStep(supervisorStep('🧠 Supervisor · plan'));
+						break;
 					}
-					malformedFrames = 0;
+					case 'plan': {
+						recordPlanSteps(payloadObj.steps);
+						await switchStep(supervisorStep('🧠 Supervisor · plan'));
 
-					if (frame.type === 'sse_start') {
-						// El backend reporta el índice real desde el que empieza a
-						// mandar la cola: fija la base y no consume índice.
-						const from = Number((frame.payload as { from?: unknown } | undefined)?.from ?? 0);
+						const steps = Array.isArray(payloadObj.steps) ? payloadObj.steps : [];
 
-						baseIndex = Number.isFinite(from) && from >= 0 ? from : 0;
-						receivedOnConnection = 0;
+						if (steps.length) {
+							const lines = steps.map((item, index) => {
+								const data = (item && typeof item === 'object' ? item : {}) as Record<
+									string,
+									unknown
+								>;
+								const agent = String(data.agent_name ?? data.agent ?? 'agente');
+								const subtask = String(data.subtask ?? '');
 
-						return;
-					}
+								return `${index + 1}. **${agent}** — ${subtask}`;
+							});
 
-					// Índice real de la cola (el backend lo incrusta en cada frame):
-					// recuentos locales por frame escuchado se desincronizan si el
-					// stream trae tipos que este cliente no escucha. Los frames
-					// antiguos sin índice caen al recuento local.
-					const queueIndex =
-						typeof frame.index === 'number' &&
-						Number.isFinite(frame.index) &&
-						frame.index >= 0
-							? frame.index
-							: index;
-
-					// Evento ya aplicado en una conexión anterior (replay).
-					if (queueIndex < run.appliedIndex) return;
-
-					run.appliedIndex = Math.max(run.appliedIndex, queueIndex + 1);
-
-					const payload = frame.payload as Record<string, unknown> | string | undefined;
-					const payloadObj = (payload && typeof payload === 'object' ? payload : {}) as Record<
-						string,
-						unknown
-					>;
-					const meta = frame.meta ?? {};
-					const fromSpecialist = meta.role === 'specialist';
-
-					try {
-						switch (frame.type) {
-							case 'agency_selected': {
-								recordPlanSteps(payloadObj.steps);
-								await switchStep(supervisorStep('🧠 Supervisor · plan'));
-								break;
-							}
-							case 'plan': {
-								recordPlanSteps(payloadObj.steps);
-								await switchStep(supervisorStep('🧠 Supervisor · plan'));
-
-								const steps = Array.isArray(payloadObj.steps) ? payloadObj.steps : [];
-
-								if (steps.length) {
-									const lines = steps.map((item, index) => {
-										const data = (item && typeof item === 'object' ? item : {}) as Record<
-											string,
-											unknown
-										>;
-										const agent = String(data.agent_name ?? data.agent ?? 'agente');
-										const subtask = String(data.subtask ?? '');
-
-										return `${index + 1}. **${agent}** — ${subtask}`;
-									});
-
-									emitInline(
-										`\n\n📋 **Plan de trabajo (${steps.length} pasos):**\n${lines.join('\n')}\n`
-									);
-								}
-
-								break;
-							}
-							case 'supervisor': {
-								await switchStep(supervisorStep('🧠 Supervisor · plan'));
-
-								if (String(payloadObj.status ?? '') === 'planning') {
-									emitInline('**🧠 Supervisor** analizando la tarea y creando el plan…\n');
-								}
-
-								break;
-							}
-							case 'handoff': {
-								const opened = await switchStep(supervisorStep('🧠 Supervisor · síntesis'));
-
-								if (opened) {
-									emitInline('**🤝 Handoff → Supervisor**: integrando los informes…\n\n');
-								}
-
-								break;
-							}
-							case 'agent_start': {
-								const nextStep = specialistStep(payloadObj);
-								const opened = await switchStep(nextStep);
-
-								if (opened) {
-									emitInline(
-										`\n**${nextStep.agent}**${nextStep.subtask ? ` — ${nextStep.subtask}` : ''}\n\n`
-									);
-								}
-
-								break;
-							}
-							case 'step_start': {
-								// `_run_agency_mode` emite los `step_start` como
-								// previsualización del plan y luego un `agent_start` por
-								// paso al arrancar de verdad. Abrir bloque aquí lanzaba
-								// una copia de cada paso y reabría el primero al llegar
-								// su `agent_start`. El bloque de trabajo lo abre solo
-								// `agent_start`; `step_start` queda como metadato.
-								break;
-							}
-							case 'agent_end': {
-								const agent = String(payloadObj.agent ?? 'agente');
-								const success = payloadObj.success !== false;
-								const errorText = String(payloadObj.error ?? '');
-
-								emitInline(
-									success
-										? `\n✅ **${agent}** completado\n`
-										: `\n❌ **${agent}** falló${errorText ? `: ${errorText}` : ''}\n`
-								);
-
-								break;
-							}
-							case 'text': {
-								emitInline(textOf(payload));
-								break;
-							}
-							case 'reasoning': {
-								callbacks.onReasoningChunk?.(textOf(payload));
-								break;
-							}
-							case 'usage': {
-								// Métricas del mensaje = uso TOTAL del job: se acumulan
-								// los especialistas y el supervisor.
-								const timings: ChatMessageTimings = {
-									cache_n: Number(payloadObj.cache_n ?? 0),
-									predicted_ms: Number(
-										payloadObj.completion_ms ?? payloadObj.predicted_ms ?? 0
-									),
-									predicted_n: Number(
-										payloadObj.completion_tokens ?? payloadObj.predicted_n ?? 0
-									),
-									prompt_ms: Number(payloadObj.prompt_ms ?? 0),
-									prompt_n: Number(payloadObj.prompt_tokens ?? payloadObj.prompt_n ?? 0)
-								};
-								const key =
-									typeof meta.agent === 'string' && meta.agent ? meta.agent : 'supervisor';
-								const signature = JSON.stringify(timings);
-
-								// Una repetición del mismo frame no suma dos veces; un
-								// frame nuevo (otra petición LLM del mismo agente) sí.
-								if (usageSignatures.get(key) !== signature) {
-									usageSignatures.set(key, signature);
-									usageTotals = {
-										cache_n: (usageTotals.cache_n ?? 0) + (timings.cache_n ?? 0),
-										predicted_ms:
-											(usageTotals.predicted_ms ?? 0) + (timings.predicted_ms ?? 0),
-										predicted_n:
-											(usageTotals.predicted_n ?? 0) + (timings.predicted_n ?? 0),
-										prompt_ms: (usageTotals.prompt_ms ?? 0) + (timings.prompt_ms ?? 0),
-										prompt_n: (usageTotals.prompt_n ?? 0) + (timings.prompt_n ?? 0)
-									};
-									latestTimings = usageTotals;
-									state.timings = usageTotals;
-									callbacks.onTimings?.(latestTimings);
-								}
-
-								break;
-							}
-							case 'tool_call':
-							case 'native_tool_call': {
-								if (pendingCalls.length) await finishTurn();
-
-								const toolCallId = `agency_${jobId}_${toolSequence++}`;
-								const call: ApiChatCompletionToolCall & { id: string } = {
-									function: {
-										arguments: JSON.stringify(payloadObj.arguments ?? {}),
-										name: String(payloadObj.name ?? 'tool')
-									},
-									id: toolCallId,
-									type: 'function'
-								};
-
-								pendingCalls = [...pendingCalls, call];
-								callbacks.onToolCallsStreaming?.([call]);
-								await finishTurn();
-
-								break;
-							}
-							case 'tool_result': {
-								const call = pendingCalls[0];
-
-								if (!call) break;
-
-								const result = payloadObj.result;
-
-								await callbacks.createToolResultMessage?.(
-									call.id,
-									typeof result === 'string' ? result : JSON.stringify(result ?? '')
-								);
-								pendingCalls = [];
-
-								// Turno nuevo del MISMO paso: el agente sigue
-								// razonando en su bloque después de ver el resultado
-								// del tool.
-								await newTurnInStep();
-
-								break;
-							}
-							case 'error': {
-								// El fallo de un paso/subagente no aborta el job: el
-								// supervisor re-planifica y sintetiza. Solo los errores
-								// globales cortan.
-								if (fromSpecialist || typeof payloadObj.agent === 'string') break;
-
-								settle(
-									new Error(textOf(payload) || String(payloadObj.error ?? 'Error del agente'))
-								);
-
-								break;
-							}
-							case 'done': {
-								// Los `done` que viajan por el bus (especialistas,
-								// síntesis y pasos del plan) llegan con `meta` y son
-								// hitos intermedios. El fin real del job es el `done`
-								// sin `meta` que el worker appendea en su `finally`.
-								if (fromSpecialist || Object.keys(meta).length > 0) break;
-
-								serverDone = true;
-
-								if (
-									payloadObj.content &&
-									!state.content.includes(String(payloadObj.content))
-								) {
-									emitInline(String(payloadObj.content));
-								}
-
-								if (
-									payloadObj.reasoning &&
-									!state.reasoning.includes(String(payloadObj.reasoning))
-								) {
-									callbacks.onReasoningChunk?.(String(payloadObj.reasoning));
-								}
-
-								await finishTurn();
-								callbacks.onFlowComplete?.(latestTimings);
-								settle();
-
-								break;
-							}
+							emitInline(
+								`\n\n📋 **Plan de trabajo (${steps.length} pasos):**\n${lines.join('\n')}\n`
+							);
 						}
-					} catch (error) {
-						settle(error instanceof Error ? error : new Error(String(error)));
 
-						return;
+						break;
 					}
+					case 'supervisor': {
+						await switchStep(supervisorStep('🧠 Supervisor · plan'));
 
-					// Timeline del panel de agentes: la alimenta el propio stream
-					// del chat para no abrir una segunda conexión SSE por job.
-					agentStore.applyChatAgencyEvent({
-						...frame,
-						job_id: jobId,
-						type: frame.type ?? 'message'
-					});
-				};
+						if (String(payloadObj.status ?? '') === 'planning') {
+							emitInline('**🧠 Supervisor** analizando la tarea y creando el plan…\n');
+						}
 
-				for (const type of [
-					'text',
-					'reasoning',
-					'usage',
-					'progress',
-					'tool_call',
-					'native_tool_call',
-					'tool_result',
-					'step_start',
-					'step_end',
-					'agency_selected',
-					'plan',
-					'agent_start',
-					'agent_end',
-					'handoff',
-					'supervisor',
-					'incomplete',
-					'sse_start',
-					'error',
-					'done'
-				]) {
-					next.addEventListener(type, (message) => void handle(message as MessageEvent));
+						break;
+					}
+					case 'handoff': {
+						const opened = await switchStep(supervisorStep('🧠 Supervisor · síntesis'));
+
+						if (opened) {
+							emitInline('**🤝 Handoff → Supervisor**: integrando los informes…\n\n');
+						}
+
+						break;
+					}
+					case 'agent_start': {
+						const nextStep = specialistStep(payloadObj);
+						await switchStep(nextStep);
+
+						break;
+					}
+					case 'step_start': {
+						// `_run_agency_mode` emite los `step_start` como
+						// previsualización del plan y luego un `agent_start` por
+						// paso al arrancar de verdad. Abrir bloque aquí lanzaba
+						// una copia de cada paso y reabría el primero al llegar
+						// su `agent_start`. El bloque de trabajo lo abre solo
+						// `agent_start`; `step_start` queda como metadato.
+						break;
+					}
+					case 'agent_end': {
+						const agent = String(payloadObj.agent ?? 'agente');
+						const success = payloadObj.success !== false;
+						const errorText = String(payloadObj.error ?? '');
+
+						emitInline(
+							success
+								? `\n✅ **${agent}** completado\n`
+								: `\n❌ **${agent}** falló${errorText ? `: ${errorText}` : ''}\n`
+						);
+
+						break;
+					}
+					case 'text': {
+						emitInline(textOf(payload));
+						break;
+					}
+					case 'reasoning': {
+						callbacks.onReasoningChunk?.(textOf(payload));
+						break;
+					}
+					case 'usage': {
+						// Métricas del mensaje = uso TOTAL del job: se acumulan
+						// los especialistas y el supervisor.
+						const timings: ChatMessageTimings = {
+							cache_n: Number(payloadObj.cache_n ?? 0),
+							predicted_ms: Number(payloadObj.completion_ms ?? payloadObj.predicted_ms ?? 0),
+							predicted_n: Number(payloadObj.completion_tokens ?? payloadObj.predicted_n ?? 0),
+							prompt_ms: Number(payloadObj.prompt_ms ?? 0),
+							prompt_n: Number(payloadObj.prompt_tokens ?? payloadObj.prompt_n ?? 0)
+						};
+						const key = typeof meta.agent === 'string' && meta.agent ? meta.agent : 'supervisor';
+						const signature = JSON.stringify(timings);
+
+						// Una repetición del mismo frame no suma dos veces; un
+						// frame nuevo (otra petición LLM del mismo agente) sí.
+						if (usageSignatures.get(key) !== signature) {
+							usageSignatures.set(key, signature);
+							usageTotals = {
+								cache_n: (usageTotals.cache_n ?? 0) + (timings.cache_n ?? 0),
+								predicted_ms: (usageTotals.predicted_ms ?? 0) + (timings.predicted_ms ?? 0),
+								predicted_n: (usageTotals.predicted_n ?? 0) + (timings.predicted_n ?? 0),
+								prompt_ms: (usageTotals.prompt_ms ?? 0) + (timings.prompt_ms ?? 0),
+								prompt_n: (usageTotals.prompt_n ?? 0) + (timings.prompt_n ?? 0)
+							};
+							latestTimings = usageTotals;
+							state.timings = usageTotals;
+							callbacks.onTimings?.(latestTimings);
+						}
+
+						break;
+					}
+					case 'tool_call':
+					case 'native_tool_call': {
+						if (pendingCalls.length) await finishTurn();
+
+						const toolCallId = `agency_${jobId}_${toolSequence++}`;
+						const call: ApiChatCompletionToolCall & { id: string } = {
+							function: {
+								arguments: JSON.stringify(payloadObj.arguments ?? {}),
+								name: String(payloadObj.name ?? 'tool')
+							},
+							id: toolCallId,
+							type: 'function'
+						};
+
+						pendingCalls = [...pendingCalls, call];
+						callbacks.onToolCallsStreaming?.([call]);
+						await finishTurn();
+
+						break;
+					}
+					case 'tool_result': {
+						const call = pendingCalls[0];
+
+						if (!call) break;
+
+						const result = payloadObj.result;
+
+						await callbacks.createToolResultMessage?.(
+							call.id,
+							typeof result === 'string' ? result : JSON.stringify(result ?? '')
+						);
+						pendingCalls = [];
+
+						// Turno nuevo del MISMO paso: el agente sigue
+						// razonando en su bloque después de ver el resultado
+						// del tool.
+						await newTurnInStep();
+
+						break;
+					}
+					case 'incomplete': {
+						// El backend avisa de que el plan se cerró sin que todos los
+						// pasos produjeran trabajo (paso cortado por la guarda,
+						// artefacto que no apareció, recuperación agotada). No corta
+						// el job: el `done` sin meta lo cierra. Antes este evento
+						// no tenía case y el usuario no veía nada.
+						emitInline(`\n⚠️ **Plan incompleto**: ${String(payloadObj.reason ?? '')}\n`);
+
+						break;
+					}
+					case 'tool_denied': {
+						// La whitelist del agente (`tool_policy`, backend) le negó una
+						// herramienta: el paso NO la ejecutó. El modelo ya recibe su
+						// propio aviso; aquí se le enseña al usuario, que si no veía
+						// desaparecer acciones sin explicación.
+						emitInline(
+							`\n⛔ **${String(payloadObj.agent ?? 'agente')}** intentó usar ` +
+								`\`${String(payloadObj.name ?? 'una herramienta')}\`: no está permitida para él.\n`
+						);
+
+						break;
+					}
+					case 'error': {
+						// El fallo de un paso/subagente no aborta el job: el
+						// supervisor re-planifica y sintetiza. Solo los errores
+						// globales cortan.
+						if (fromSpecialist || typeof payloadObj.agent === 'string') break;
+
+						throw new Error(textOf(payload) || String(payloadObj.error ?? 'Error del agente'));
+					}
+					case 'done': {
+						// Los `done` que viajan por el bus (especialistas,
+						// síntesis y pasos del plan) llegan con `meta` y son
+						// hitos intermedios. El fin real del job es el `done`
+						// sin `meta` que el worker appendea en su `finally`:
+						// el TRANSPORTE lo detecta y cierra el stream.
+						if (fromSpecialist || Object.keys(meta).length > 0) break;
+
+						if (payloadObj.content && !state.content.includes(String(payloadObj.content))) {
+							emitInline(String(payloadObj.content));
+						}
+
+						if (payloadObj.reasoning && !state.reasoning.includes(String(payloadObj.reasoning))) {
+							callbacks.onReasoningChunk?.(String(payloadObj.reasoning));
+						}
+
+						await finishTurn();
+						callbacks.onFlowComplete?.(latestTimings);
+
+						break;
+					}
 				}
+			} catch (error) {
+				// Un fallo al pintar el frame corta el stream: para eso está el catch
+				// de `onFrame` en el transporte.
+				throw error instanceof Error ? error : new Error(String(error));
+			}
+		};
 
-				next.onerror = () => {
-					if (settled || serverDone) return;
+		/**
+		 * Corta el job en el BACKEND. Sin esto, el botón de parar nativo solo
+		 * cerraba el EventSource: el orquestador y los agentes seguían trabajando
+		 * (y el modelo generando) hasta terminar.
+		 */
+		const cancelAgencyJob = () => {
+			void fetch(`${endpoint}/agent_execute/${jobId}`, {
+				headers: { ...authHeaders() },
+				method: 'DELETE'
+			}).catch(() => {
+				// La cancelación es best-effort: el job ya puede haber terminado.
+			});
+		};
 
-					// El corte NO cancela el job: el backend sigue trabajando y el
-					// reintento reanuda por índice. Antes, un microcorte (o un tool
-					// largo detrás de un proxy) mataba la ejecución completa.
-					next.close();
-					source = null;
-					scheduleReconnect();
-				};
-			};
+		await streamAgencyJob({
+			endpoint,
+			from: run.appliedIndex,
+			jobId,
+			onAppliedIndex: (appliedIndex) => {
+				run.appliedIndex = appliedIndex;
+			},
+			onCancel: () => cancelAgencyJob(),
+			onFrame: async (frame) => {
+				await translateFrame(frame);
 
-			signal.addEventListener('abort', onAbort, { once: true });
-			connect();
+				// Timeline del panel de agentes: la alimenta el propio stream del
+				// chat para no abrir una segunda conexión SSE por job.
+				agentStore.applyChatAgencyEvent({
+					...frame,
+					job_id: jobId,
+					type: frame.type ?? 'message'
+				});
+			},
+			onReconnect: (attempt, delayMs) => {
+				console.warn(
+					`[agency] stream SSE caido; reintento ${attempt}/${AGENCY_RECONNECT_MAX_ATTEMPTS} en ${delayMs}ms`
+				);
+			},
+			signal
 		});
 	}
 
@@ -2539,9 +2394,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		if (!initialMessage) return false;
 
-		// El chat asume el stream del job: la timeline del panel se alimenta
-		// desde aquí (una sola conexión SSE por job).
-		agentStore.claimAgencyJob(convId);
+		// El chat es el único dueño del stream del job: la timeline del panel se
+		// alimenta desde aquí (una sola conexión SSE por job).
 		agentStore.beginAgencyTimeline(convId);
 		agentStore.applyChatAgencyEvent({ job_id: jobId, type: 'step_start' });
 
@@ -2563,14 +2417,20 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		const signal = this.getOrCreateAbortController(convId).signal;
 
 		try {
-			await this.consumeAgencyJob(jobId, endpoint, convId, writer.callbacks, writer.state, run, signal);
+			await this.consumeAgencyJob(
+				jobId,
+				endpoint,
+				convId,
+				writer.callbacks,
+				writer.state,
+				run,
+				signal
+			);
 		} catch (error) {
 			agentStore.finishAgencyTimeline();
 
 			if (!isAbortError(error)) {
-				await writer.callbacks.onError?.(
-					error instanceof Error ? error : new Error(String(error))
-				);
+				await writer.callbacks.onError?.(error instanceof Error ? error : new Error(String(error)));
 			}
 		} finally {
 			this.agencyRuns.delete(convId);

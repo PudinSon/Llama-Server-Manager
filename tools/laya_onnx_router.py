@@ -1,15 +1,20 @@
 """
 tools/laya_onnx_router.py
 
-Router de tareas basado en el modelo Laya (ONNX) que sustituye al `ToolRouter`
-de Gemma cuando está disponible. Gemma cuesta una llamada LLM completa por
-tarea (segundos); Laya es un clasificador de 650 MB (~100× más rápido).
+Router de tareas basado en el modelo Laya (ONNX): el clasificador de modo,
+naturaleza y dominios del sistema. De las tres cabezas, modo y naturaleza son
+las que el modelo ya declara; la de dominios es opcional y, si no está
+entrenada/declarada, `task_router` cubre el hueco con su tabla léxica. Ya no hay router LLM que sustituir —clasificar con
+Gemma costaba una llamada completa por tarea (segundos) y producía decisiones
+menos estables—, así que Laya es la vía principal y las heurísticas léxicas de
+`task_router` el respaldo cuando el modelo no está.
 
 Diseño defensivo a propósito: este módulo NO puede romper el sistema.
 - `onnxruntime` y `tokenizers` se importan dentro de `load()`, no al importar
   el módulo (dev_agent arranca aunque falten).
 - Si el modelo no está, si falla la carga o si la inferencia da algo raro,
-  `route()` devuelve el diccionario de fallback y el orquestador usa Gemma.
+  `route()` devuelve el diccionario de fallback y `task_router.decide` usa las
+  heurísticas léxicas.
 - `route()` nunca lanza excepción.
 
 Calibración pendiente: el formato exacto de prompt/scoring de Laya debe
@@ -44,13 +49,18 @@ except ImportError:  # pragma: no cover - ejecución suelta
 logger = logging.getLogger("laya_onnx_router")
 
 
-#: Modos válidos. Espejo de `agent_core.ToolRouter.MODES` (se mantienen
-#: duplicados a propósito para no importar `agent_core` —y con él ChromaDB—
+#: Modos válidos. Espejo de `task_router.MODES` / `agent_core.MODES` (se
+#: mantienen duplicados a propósito para no importar `agent_core` —pesado—
 #: solo por una tupla; hay un test que verifica que no divergen).
 MODES: Sequence[str] = ("CHAT", "AGENCY")
 
 #: Naturalezas válidas. Espejo de `agent_core.TASK_NATURES`.
 NATURES: Sequence[str] = ("synthesis", "construction", "mixed")
+
+#: Dominios válidos. Espejo de `task_router.DOMAINS` (tercera cabeza del modelo;
+#: mientras el modelo no la declare, `task_router.detect_domains` da el respaldo
+#: léxico y el sub-catálogo de `agency_domains` filtra con ese respaldo).
+DOMAINS: Sequence[str] = ("coding", "research", "math", "creative", "business", "ops")
 
 #: Marcadores del formato Laya (estado/pregunta), configurables por
 #: `rl_agent_config.json` (`prompt_markers` o `marker_start`/`marker_end`).
@@ -59,8 +69,15 @@ DEFAULT_MARKER_END = "<|/marker|>"
 
 MODE_QUESTION = "¿Qué modo de ejecución requiere esta tarea?"
 NATURE_QUESTION = "¿Qué naturaleza tiene el trabajo: texto único o artefactos persistentes?"
+DOMAIN_QUESTION = "¿A qué dominios de trabajo pertenece esta tarea?"
 
-_FALLBACK = {"mode": "AGENCY", "nature": "synthesis", "confidence": 0.0, "reasoning": "fallback"}
+_FALLBACK = {
+    "mode": "AGENCY",
+    "nature": "synthesis",
+    "domains": [],
+    "confidence": 0.0,
+    "reasoning": "fallback",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -226,29 +243,41 @@ class LayaONNXRouter:
     def _encode(self, text: str) -> Dict[str, Any]:
         return self._tokenizer.encode(text).ids
 
-    def _labels_for(self, choices_key: str) -> List[str]:
-        """Orden de etiquetas de la cabeza clasificadora.
+    def _declared_labels(self, choices_key: str) -> Optional[List[str]]:
+        """Etiquetas que el modelo declara para esa cabeza, o None si no lo hace.
 
-        Si `rl_agent_config.json` declara `labels` (o `choices`) para ese
-        clasificador, ESE es el orden autoritativo del modelo. Si no lo declara
-        se usa el orden canónico de `MODES`/`NATURES` y se registra en el log:
-        mapear el argmax por posición sin conocer el orden real de las etiquetas
-        es una suposición, y las suposiciones silenciosas son las que luego
-        cuestan una tarde de depuración.
+        `None` es información, no un hueco: significa que el modelo NO tiene (o
+        no declara) esa cabeza, y quien pregunte debe usar su propio respaldo en
+        vez de interpretar un argmax ajeno.
         """
-        canonical = {"mode": list(MODES), "nature": list(NATURES)}[choices_key]
-        declared = None
         try:
             config = self._choices_config or {}
             for key in ("labels", "choices"):
                 block = config.get(key)
                 if isinstance(block, dict) and isinstance(block.get(choices_key), list):
-                    declared = block[choices_key]
-                    break
+                    return [str(item) for item in block[choices_key]]
         except Exception:
-            declared = None
+            return None
+        return None
+
+    def _labels_for(self, choices_key: str) -> List[str]:
+        """Orden de etiquetas de la cabeza clasificadora.
+
+        Si `rl_agent_config.json` declara `labels` (o `choices`) para ese
+        clasificador, ESE es el orden autoritativo del modelo. Si no lo declara
+        se usa el orden canónico de `MODES`/`NATURES`/`DOMAINS` y se registra en
+        el log: mapear el argmax por posición sin conocer el orden real de las
+        etiquetas es una suposición, y las suposiciones silenciosas son las que
+        luego cuestan una tarde de depuración.
+        """
+        canonical = {
+            "mode": list(MODES),
+            "nature": list(NATURES),
+            "domains": list(DOMAINS),
+        }[choices_key]
+        declared = self._declared_labels(choices_key)
         if declared:
-            return [str(item) for item in declared]
+            return declared
         logger.debug(
             "Laya: sin orden de etiquetas declarado para '%s'; se asume el canónico",
             choices_key,
@@ -350,17 +379,19 @@ class LayaONNXRouter:
                 self.build_prompt(task, NATURE_QUESTION), list(NATURES), "nature"
             )
             nature = nature_result["choice"] if nature_result else "synthesis"
+            domains = self.route_domains(task) or []
             elapsed_ms = (time.perf_counter() - started) * 1000
 
             decision = {
                 "mode": str(mode_result["choice"]).upper(),
                 "nature": nature,
+                "domains": domains,
                 "confidence": float(mode_result["probability"]),
                 "reasoning": f"Laya multilingual ({elapsed_ms:.0f} ms)",
                 "tools_desc": "",
                 "router": "laya",
             }
-            _audit(task, mode_result, nature_result, fallback=False)
+            _audit(task, mode_result, nature_result, fallback=False, domains=domains)
             if bus is not None:
                 try:
                     bus.emit(_event("router", {"status": "decided", "router": "laya", **decision}))
@@ -371,6 +402,27 @@ class LayaONNXRouter:
             logger.warning("Laya route falló: %s", exc)
             _audit(task, None, None, fallback=True)
             return dict(_FALLBACK, router="fallback", tools_desc="")
+
+    def route_domains(self, task: str) -> Optional[List[str]]:
+        """Dominios de la tarea según la tercera cabeza del modelo, o None.
+
+        Devuelve None mientras el modelo no DECLARE etiquetas de dominio en
+        `rl_agent_config.json` (`labels.domains` o `choices.domains`): no se
+        inventa una cabeza que no está entrenada ni se interpreta el argmax de
+        la cabeza de modo como si fuera un dominio. Cuando devuelve None,
+        `task_router.decide` usa su tabla léxica, que produce el MISMO contrato.
+        """
+        if self._declared_labels("domains") is None:
+            return None
+        if not self.ensure_loaded():
+            return None
+        result = self._classify(
+            self.build_prompt(task, DOMAIN_QUESTION), list(DOMAINS), "domains"
+        )
+        if not result:
+            return None
+        choice = str(result["choice"]).strip().casefold()
+        return [choice] if choice in DOMAINS else None
 
     def route_nature(self, task: str) -> str:
         """Solo la naturaleza (`synthesis` | `construction` | `mixed`)."""
@@ -402,7 +454,13 @@ def _event(event_type: str, payload: Dict[str, Any]):
         return None
 
 
-def _audit(task: str, mode_result, nature_result, fallback: bool) -> None:
+def _audit(
+    task: str,
+    mode_result,
+    nature_result,
+    fallback: bool,
+    domains: Optional[Sequence[str]] = None,
+) -> None:
     """Traza de auditoría de la decisión (Acción 8.6).
 
     Sin esto, depurar una clasificación errónea es imposible: no queda registro
@@ -415,6 +473,7 @@ def _audit(task: str, mode_result, nature_result, fallback: bool) -> None:
             "mode": (mode_result or {}).get("choice"),
             "mode_prob": round((mode_result or {}).get("probability", 0.0), 4),
             "nature": (nature_result or {}).get("choice"),
+            "domains": list(domains or ()),
             "fallback": fallback,
         }, ensure_ascii=False),
     )

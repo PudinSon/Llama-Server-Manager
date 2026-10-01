@@ -52,13 +52,22 @@ except Exception:
 import tools.process_manager as process_manager
 import tools.web_helper as web_helper
 from tools.dev_agent import DEFAULT_SETTINGS
-from tools.llama_params import LLAMA_PERFORMANCE_DEFAULTS, LlamaCommandMixin
+from tools.llama_params import (
+    DEFAULT_REASONING_FORMAT,
+    LLAMA_PERFORMANCE_DEFAULTS,
+    REASONING_FORMATS,
+    LlamaCommandMixin,
+    migrate_reasoning_format,
+)
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 ROUTER_MODE_TOKEN = "__router__"
 WEB_MANAGER_PORT = 12000
+#: Puerto del servicio de automatización 24/7 (dispatchers, cola y webhooks).
+#: Lo arranca este manager como proceso hijo: sin manager no hay modelo.
+AUTOMATION_PORT = int(os.environ.get("AUTOMATION_PORT", "15001"))
 try:
     from tools.env_detector import has_gui_environment
     HAS_GUI = has_gui_environment()
@@ -261,6 +270,10 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
             "n_gpu_layers": 24,
             "temp": 0.5,
             "repeat_penalty": 1.05,
+            # Muestreo generalista (mismos defaults que llama.cpp). Van tras
+            # --repeat-penalty en el comando; el panel web usa los mismos.
+            "top_p": 0.95,
+            "top_k": 40,
             "webui_mcp_proxy": True,
             "embed_chunk_size": 512,
             "embed_max_fragments": 3,
@@ -432,6 +445,15 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
             pass
         # 2.5 Workspace HTTP (puerto 19000)
         self.start_workspace_server()
+
+        # 2.6 Automatización 24/7 (puerto 15001): dispatchers, cola y webhooks.
+        # Vive en su propio proceso para que cerrar la web view no la detenga,
+        # pero es hija del manager: sin manager no hay modelo cargado y sin
+        # modelo los dispatchers no tendrían nada que ejecutar.
+        if self.defaults.get("automation_enabled", True):
+            self.start_automation_service()
+        else:
+            self.log("⏭️ Automatización 24/7 desactivada en Configuración Avanzada.")
 
         # 3. OfficeCLI MCP (stdio)
         self._ensure_mcp_config()
@@ -658,17 +680,19 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
                 except Exception:
                     pass
 
-            def _force_exit():
+            # Red de seguridad: si por algún motivo el cierre ordenado no llega
+            # a ejecutarse (p. ej. el bucle de Tk ya no procesa `after`),
+            # forzamos la salida del exe. El tiempo es holgado para NO cortar la
+            # parada secuencial de los servicios (que es lo que antes dejaba
+            # procesos vivos).
+            def _fallback_exit():
                 try:
-                    time.sleep(1.0)
-                    os._exit(0)
+                    time.sleep(max(self.SHUTDOWN_GRACE_SECONDS + 30.0, 90.0))
                 except Exception:
-                    try:
-                        sys.exit(0)
-                    except Exception:
-                        pass
+                    pass
+                self._force_exit_process(code=0)
             try:
-                threading.Thread(target=_force_exit, daemon=True).start()
+                threading.Thread(target=_fallback_exit, daemon=True).start()
             except Exception:
                 pass
 
@@ -1488,6 +1512,60 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
         except Exception as e:
             self.log(f"❌ Error iniciando workspace server: {e}")
             self.workspace_server_process = None
+
+    # ------------------------------------------------------------------
+    # AUTOMATIZACIÓN 24/7 (servicio de dispatchers en el puerto 15001)
+    # ------------------------------------------------------------------
+    def start_automation_service(self, wait=25.0):
+        """Arranca el servicio 24/7 (dispatchers, cola y webhooks).
+
+        El servicio corre en su PROPIO proceso: el visor y el panel web solo son
+        clientes HTTP, así que cerrar la web view no lo detiene. Pero el manager
+        es su dueño: lo arranca aquí y lo para en `on_close`, y si el manager
+        muere de golpe el watchdog `--parent-pid` del servicio lo cierra al
+        detectar que su padre desapareció. Sin manager no hay modelo y los
+        dispatchers no tendrían nada que ejecutar.
+        """
+        port = AUTOMATION_PORT
+        try:
+            from tools.automation_process import start as start_automation
+
+            result = start_automation(
+                port_number=port,
+                workspace=self.defaults.get("workspace_path"),
+                parent_pid=os.getpid(),
+                wait=wait,
+            )
+            if not result.get("success"):
+                self.log(f"⚠️ Automatización 24/7 no arrancó: {result.get('error')}")
+                for line in str(result.get("log_tail") or "").splitlines()[-5:]:
+                    self.log(f"   [AUTO] {line}")
+                return result
+            if result.get("status") == "already_running":
+                self.log(f"🤖 Automatización 24/7 ya estaba activa en el puerto {port}")
+            elif result.get("status") == "starting":
+                self.log(f"🤖 Automatización 24/7 arrancando (PID {result.get('pid')}); aún no escucha en {port}")
+            else:
+                self.log(f"🤖 Automatización 24/7 activa en {result.get('url')} (PID {result.get('pid')})")
+            self.log(f"   log: {result.get('log')}")
+            return result
+        except Exception as e:
+            self.log(f"⚠️ Automatización 24/7 no disponible: {e}")
+            return {"success": False, "error": str(e)}
+
+    def stop_automation_service(self, wait=3.0):
+        """Detiene el servicio 24/7 y libera el puerto 15001."""
+        port = AUTOMATION_PORT
+        try:
+            from tools.automation_process import stop as stop_automation
+
+            result = stop_automation(port_number=port, wait=wait)
+            if result.get("success"):
+                self.log("⏹️ Automatización 24/7 detenida")
+            return result
+        except Exception as e:
+            self.log(f"⚠️ No se pudo detener la automatización 24/7: {e}")
+            return {"success": False, "error": str(e)}
 
     def stop_workspace_server(self, wait=True):
         """Detiene el servidor HTTP del workspace y libera el puerto 19000."""
@@ -2622,10 +2700,13 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
         try:
             win = ctk.CTkToplevel(self)
             win.title("Configuración Avanzada")
-            win.geometry("880x800")
+            win.geometry("920x900")
+            win.minsize(840, 700)
             tabs = ctk.CTkTabview(win)
             tabs.pack(padx=12, pady=12, fill="both", expand=True)
-            frame = tabs.add("Básico")
+            basic_tab = tabs.add("Básico")
+            frame = ctk.CTkScrollableFrame(basic_tab)
+            frame.pack(fill="both", expand=True, padx=4, pady=4)
             perf_tab_host = tabs.add("Rendimiento y Avanzado")
             # El contenido de esta pestaña no cabe en la ventana: frame con scroll.
             perf_scroll = ctk.CTkScrollableFrame(perf_tab_host)
@@ -2647,14 +2728,17 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
                 "n_gpu_layers": "Capas del modelo que se cargan en GPU (-ngl). 'auto' decide según tu VRAM; 'all' sube todo; un número menor deja el resto en CPU.",
                 "temp": "Temperatura de muestreo: baja (0.1-0.4) = respuestas más deterministas; alta (>0.8) = más creativas e impredecibles.",
                 "repeat_penalty": "Penalización de repetición (1 = desactivada). 1.05-1.15 evita bucles sin coartar mucho el estilo; valores altos degradan la coherencia.",
+                "top_p": "Top-p (nucleus sampling, --top-p): 0.95 = generalista; recorta la cola de tokens improbables sin perder variedad. 1.0 = desactivado. Evita combinarlo con un --top-k muy agresivo.",
+                "top_k": "Top-k (--top-k): limita el muestreo a las N palabras más probables. 40 = generalista; 0 = desactivado (sin filtro, más diverso y más impredecible).",
                 "webui_mcp_proxy": "Expone el proxy MCP en la WebUI para que el agente use sus herramientas desde el navegador.",
                 "gpu_for_embeddings": "Carga el modelo de embeddings en GPU (por defecto ON): acelera el RAG a cambio de VRAM.",
                 "gpu_for_chat": "Carga el modelo de chat en GPU (por defecto OFF): mucha más velocidad si tienes VRAM suficiente para el modelo y su contexto.",
                 "use_agent": "Activa --agent en llama-server: herramientas integradas (archivos, código…) usables por AGENCY/PLAN.",
                 "no_ui": "Oculta el visor embebido (--no-ui): útil en servidores headless o si solo usas el panel web.",
                 "piper_enabled": "Servicio de voz Piper (TTS local). Consume ~200 MB de RAM; desactívalo si no usas salida de audio.",
+                "automation_enabled": "Servicio de automatización 24/7 (puerto 15001): cola persistente, dispatchers (webhooks, cron, filewatch, IMAP), aprobaciones y auditoría. El manager lo arranca al iniciar y lo detiene al cerrarse — sin manager no hay modelo y los dispatchers no tendrían nada que ejecutar. Corre en su propio proceso, así que cerrar la web view no lo detiene; si el manager muere de golpe, el watchdog del servicio lo cierra.",
                 "enable_multimodal": "Carga el proyector visual (mmproj) para procesar imágenes. Nota: desactiva --cache-reuse y ralentiza cada paso en CPU; desactívalo para tareas solo de texto.",
-                "laya_enabled": "Sustituye la llamada LLM del ToolRouter por un clasificador ONNX (~650 MB RAM, ~100× más rápido). Sin modelo, el orquestador usa Gemma.",
+                "laya_enabled": "Clasificador ONNX local (~650 MB RAM, ~100× más rápido que una llamada LLM) que decide modo, naturaleza y dominio de cada tarea. Sin modelo, el orquestador usa las heurísticas léxicas.",
                 "laya_preload": "Carga Laya en memoria al arrancar el manager; si no, se carga en la primera ruta (primer uso algo más lento).",
                 # ── Rendimiento ──
                 "batch_size": "Lógico de tokens procesados por pasada (-b). Más alto = más rapidez y más RAM. Recomendado: múltiplo del ubatch; en CPU, 512-2048 suele bastar.",
@@ -2665,6 +2749,8 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
                 "threads_http": "Hilos del servidor HTTP integrado. Súbelo solo con muchas peticiones concurrentes; con 1-2 clientes no aporta nada.",
                 "timeout": "Tiempo máximo de espera por petición en segundos (-to). Con modelos lentos o contextos enormes, súbelo para evitar cortes prematuros.",
                 "perf_enabled": "Activa --perf: el servidor registra tiempos por fase (prompt eval, generación…) para diagnosticar cuellos de botella. Impacto mínimo en rendimiento.",
+                "reasoning_preserve": "Preserva la traza de razonamiento en TODO el historial (--reasoning-preserve), no solo en el último mensaje del asistente. Necesita una plantilla con soporte de preserve reasoning; si no lo tiene, llama.cpp lo ignora.",
+                "reasoning_format": "Formato del razonamiento (--reasoning-format). none: deja los 'thoughts' dentro del contenido. deepseek: los extrae a message.reasoning_content (el formato que consume el agente). deepseek-legacy: mantiene las etiquetas <think> en el contenido y además rellena reasoning_content. auto: lo decide la plantilla del modelo y es el valor por defecto de llama-server, así que no se añade el flag. Solo se aplica si tu llama-server reconoce el flag.",
                 "load_mode": "Modo de carga del modelo (-lm). mmap: mapea el archivo (arranque rápido, RAM bajo demanda). mlock: fija el modelo en RAM (estable, necesita memoria libre). dio: E/S directa (menos caché de disco).",
                 "no_kv_offload": "Mantiene la caché KV en CPU (-nkvo) aunque haya GPU: libera VRAM del modelo a cambio de generación algo más lenta.",
                 "dspark_enabled": "Decodificación especulativa: el modelo draft (DSpark) propone tokens y el principal los verifica en bloque. Más tokens/segundo si el draft acierta.",
@@ -2711,21 +2797,8 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
             add_row("n_gpu_layers", "n_gpu_layers", 6)
             add_row("Temp", "temp", 7)
             add_row("Repeat penalty", "repeat_penalty", 8)
-
-            try:
-                actions_frame = ctk.CTkFrame(frame)
-                actions_frame.grid(row=14, column=0, columnspan=2, sticky="e", padx=8, pady=6)
-                btn_kwargs = {"height": 36, "width": 240}
-                ctk.CTkButton(actions_frame, text="Copiar mmproj al modelo seleccionado",
-                              command=self._copy_mmproj_to_model_dir_from_dialog, **btn_kwargs).pack(side="left",
-                                                                                                    padx=(0, 8))
-                # Dentro de open_advanced_config, en el frame actions_frame:
-                ctk.CTkButton(actions_frame, text="Iniciar con Windows", fg_color="#2b8fef",
-                              command=lambda: self._install_windows_task_wrapper(win), **btn_kwargs).pack(side="left", padx=(0,8))
-                ctk.CTkButton(actions_frame, text="Deshabilitar inicio con Windows", fg_color="#f06c6c",
-                              command=lambda: self._uninstall_windows_task_wrapper(win), **btn_kwargs).pack(side="left")
-            except Exception:
-                pass
+            add_row("Top-p", "top_p", 9)
+            add_row("Top-k", "top_k", 10)
 
             self.gpu_embed_var = tk.IntVar(value=1 if self.defaults.get("gpu_for_embeddings", True) else 0)
             self.gpu_chat_var = tk.IntVar(value=1 if self.defaults.get("gpu_for_chat", False) else 0)
@@ -2761,6 +2834,20 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
             piper_chk.grid(row=17, column=0, columnspan=2, sticky="w", padx=8, pady=4)
             _add_tip(piper_chk, "piper_enabled")
 
+            # Servicio de automatización 24/7 (dispatchers, cola y webhooks).
+            # Es la única "área de activación": el manager lo arranca al iniciar
+            # y lo detiene al cerrarse, y sobrevive al cierre de la web view.
+            self.automation_var = tk.IntVar(
+                value=1 if self.defaults.get("automation_enabled", True) else 0
+            )
+            automation_chk = ctk.CTkCheckBox(
+                frame,
+                text="Activar servicio de automatización 24/7 (dispatchers, cola y webhooks)",
+                variable=self.automation_var,
+            )
+            automation_chk.grid(row=19, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+            _add_tip(automation_chk, "automation_enabled")
+
             # ── Proyector visual (mmproj) ──────────────────────────────
             # Desactivar mmproj reactiva --cache-reuse: cada paso de
             # AGENCY/PLAN puede reutilizar el prefijo KV del paso anterior.
@@ -2777,8 +2864,8 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
 
             # ── Router Laya ONNX ──────────────────────────────────────
             # Clasificador de modo/naturaleza: sustituye la llamada LLM del
-            # ToolRouter (Gemma) por una inferencia ONNX de ~650 MB, ~100× más
-            # rápida. Opcional: sin modelo, el orquestador usa Gemma.
+            # clasificación de tareas por una inferencia ONNX de ~650 MB, ~100×
+            # más rápida. Opcional: sin modelo, el orquestador usa heurísticas.
             self.laya_var = tk.IntVar(
                 value=1 if self.defaults.get("laya_enabled", True) else 0
             )
@@ -2800,6 +2887,28 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
             )
             laya_preload_chk.grid(row=21, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 8))
             _add_tip(laya_preload_chk, "laya_preload")
+
+            basic_actions = ctk.CTkFrame(frame)
+            basic_actions.grid(row=22, column=0, columnspan=2, sticky="ew", padx=8, pady=(12, 8))
+            basic_actions.grid_columnconfigure(0, weight=1)
+            basic_actions.grid_columnconfigure(1, weight=1)
+            ctk.CTkButton(
+                basic_actions,
+                text="Copiar mmproj al modelo seleccionado",
+                command=self._copy_mmproj_to_model_dir_from_dialog,
+                height=36,
+            ).grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=8)
+            startup_button = ctk.CTkButton(
+                basic_actions,
+                text=(
+                    "Deshabilitar inicio con Windows"
+                    if self._windows_task_installed()
+                    else "Habilitar inicio con Windows"
+                ),
+                command=lambda: self._toggle_windows_task_wrapper(win, startup_button),
+                height=36,
+            )
+            startup_button.grid(row=0, column=1, sticky="ew", padx=(4, 8), pady=8)
 
             # ================= PESTAÑA: RENDIMIENTO Y AVANZADO =================
             # Los textos de ayuda viven en CONFIG_HELP (definido arriba, común a
@@ -2859,9 +2968,17 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
             add_perf_row("Threads HTTP:", "threads_http")
             add_perf_row("Timeout (-to):", "timeout")
             add_perf_check("--perf (diagnóstico)", "perf_enabled")
+            add_perf_check("--reasoning-preserve", "reasoning_preserve")
+            # Selector: llama-server acepta una lista cerrada de valores.
+            add_perf_combo(
+                "--reasoning-format:",
+                "reasoning_format",
+                options=list(REASONING_FORMATS),
+                default=DEFAULT_REASONING_FORMAT,
+            )
 
             add_perf_title("── Memoria ──")
-            add_perf_combo("Load mode (-lm):", "load_mode", options=["auto", "mmap", "mlock", "mmap+mlock", "dio"], default="auto")
+            add_perf_combo("Load mode (-lm):", "load_mode", options=["auto", "mmap", "none", "mlock", "mmap+mlock", "dio"], default="auto")
             add_perf_check("--no-kv-offload (-nkvo)", "no_kv_offload")
 
             add_perf_title("── DSpark ──")
@@ -2949,9 +3066,9 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
                         if k == "n_gpu_layers":
                             # Admite entero, "auto" o "all".
                             self.defaults[k] = self._normalize_ngl(val, "auto")
-                        elif k in ("chat_port", "embed_port", "c", "threads_chat", "threads_embed"):
+                        elif k in ("chat_port", "embed_port", "c", "threads_chat", "threads_embed", "top_k"):
                             self.defaults[k] = int(val)
-                        elif k in ("temp", "repeat_penalty"):
+                        elif k in ("temp", "repeat_penalty", "top_p"):
                             self.defaults[k] = float(val)
                         else:
                             self.defaults[k] = val
@@ -2970,9 +3087,11 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
                         raw_threads = perf_entries[k].get().strip()
                         self.defaults[k] = self._safe_int(raw_threads, None) if raw_threads else None
                     self.defaults["override_tensor"] = perf_entries["override_tensor"].get().strip()
-                    for k in ("load_mode", "spec_draft_type_k", "spec_draft_type_v"):
+                    for k in ("load_mode", "spec_draft_type_k", "spec_draft_type_v",
+                              "reasoning_format"):
                         self.defaults[k] = perf_vars[k].get()
-                    for k in ("perf_enabled", "no_kv_offload", "dspark_enabled",
+                    for k in ("perf_enabled", "no_kv_offload", "reasoning_preserve",
+                              "dspark_enabled",
                               "gpu_for_dspark", "moe_enabled", "gpu_for_moe", "cpu_moe"):
                         self.defaults[k] = bool(perf_vars[k].get())
 
@@ -2997,12 +3116,23 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
                             )
                             return
                     self.defaults["piper_enabled"] = piper_enabled
+                    self.defaults["automation_enabled"] = bool(self.automation_var.get())
                     self.save_config()
                     if piper_enabled:
                         if not (self.piper_process and self.piper_process.poll() is None):
                             self.start_piper_service()
                     else:
                         self.stop_piper_service()
+
+                    # Automatización 24/7: si se activa aquí, arranca ya (en
+                    # hilo aparte: cargar el dispatcher no debe congelar el
+                    # diálogo); si se desactiva, se detiene y libera el puerto.
+                    if self.defaults.get("automation_enabled", True):
+                        threading.Thread(
+                            target=self.start_automation_service, daemon=True
+                        ).start()
+                    else:
+                        self.stop_automation_service()
                     self.log("Configuración avanzada guardada.")
                     win.destroy()
                     self.update_status()
@@ -3178,6 +3308,37 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
     def _uninstall_windows_task_wrapper(self, parent_win):
      threading.Thread(target=self.uninstall_windows_task, args=(parent_win,), daemon=True).start()
 
+    def _windows_task_installed(self):
+        if os.name != "nt":
+            return False
+        try:
+            result = subprocess.run(
+                ["schtasks.exe", "/Query", "/TN", "LlamaServerManager"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _toggle_windows_task_wrapper(self, parent_win, button):
+        def toggle():
+            if self._windows_task_installed():
+                self.uninstall_windows_task(parent_win)
+            else:
+                self.install_windows_task(parent_win)
+            if parent_win and parent_win.winfo_exists():
+                label = (
+                    "Deshabilitar inicio con Windows"
+                    if self._windows_task_installed()
+                    else "Habilitar inicio con Windows"
+                )
+                parent_win.after(0, lambda: button.configure(text=label))
+
+        threading.Thread(target=toggle, daemon=True).start()
+
     def _install_service_thread(self, parent_win):
      if os.name == 'nt':
         self.install_windows_task(parent_win)
@@ -3236,6 +3397,10 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
             self.defaults["auto_start_enabled"] = data["defaults"]["auto_start_enabled"]
         if "auto_start_model" in data.get("defaults", {}):
             self.defaults["auto_start_model"] = data["defaults"]["auto_start_model"]
+
+        # Razonamiento: el antiguo checkbox `reasoning_format_enabled` es ahora
+        # el selector `reasoning_format` (la migración conserva su efecto).
+        migrate_reasoning_format(self.defaults)
 
         # Migración mínima de n_gpu_layers: admite entero, "auto" o "all".
         try:
@@ -3422,71 +3587,211 @@ class LlamaServerManager(ctk.CTk, LlamaCommandMixin):
             pass
 
     # ---------- CIERRE ----------
+    # Puertos que el manager debe dejar libres al cerrar. La duplicación de
+    # AUTOMATION_PORT (15001) es intencional: si el entorno redefine la variable
+    # seguimos cubriendo el valor por defecto.
+    SHUTDOWN_PORTS = (15000, 8081, 8082, 25000, 5000, 5001, 8880, 19000, 15001)
+
+    # Tiempo máximo que esperamos a que el cierre ordenado termine antes de
+    # forzar la salida del ejecutable principal. Holgado respecto a la suma de
+    # los timeouts de cada `stop_*` (~40 s en el peor caso).
+    SHUTDOWN_GRACE_SECONDS = 60.0
+
+    def _stop_all_services(self):
+        """Detiene ordenadamente TODOS los procesos hijos gestionados por el manager.
+
+        Es idempotente y seguro de invocar desde cualquier hilo (no toca la GUI).
+        No cierra la ventana ni sale del proceso: de eso se encarga `on_close`.
+        """
+        # Orden de cierre: visor, chat, embeddings, MCP, workspace,
+        # automatización 24/7, RAG, Piper, Config y Telegram.
+        viewer = getattr(self, "viewer_process", None)
+        if viewer:
+            try:
+                process_manager.close_process_gracefully(viewer, timeout=3.0)
+            except Exception:
+                pass
+            self.viewer_process = None
+
+        chat = getattr(self, "chat_process", None)
+        if chat:
+            try:
+                process_manager.stop_server(chat, port=8081, wait=2.0)
+            except Exception:
+                pass
+            self.chat_process = None
+
+        embedding = getattr(self, "embedding_process", None)
+        if embedding:
+            try:
+                process_manager.stop_server(embedding, port=8082, wait=2.5)
+            except Exception:
+                pass
+            self.embedding_process = None
+
+        # El servicio 24/7 es hijo del manager: se apaga con él (sin manager no
+        # hay modelo, y sus dispatchers quedarían en el aire).
+        stoppers = (
+            ("stop_dev_agent", {"wait": True}),
+            ("stop_officecli", {}),
+            ("stop_workspace_server", {"wait": True}),
+            ("stop_automation_service", {}),
+            ("stop_rag_service", {"force": True}),
+            ("stop_piper_service", {}),
+        )
+        for name, kwargs in stoppers:
+            fn = getattr(self, name, None)
+            if not callable(fn):
+                continue
+            try:
+                fn(**kwargs)
+            except Exception as e:
+                try:
+                    self.log(f"⚠️ Error en {name}: {e}")
+                except Exception:
+                    pass
+
+        # Detener servidor de configuración
+        try:
+            from tools.config_server import stop_config_server
+            stop_config_server()
+        except Exception:
+            pass
+
+        # Detener servicio de Telegram
+        try:
+            from tools.telegram_service import stop_telegram_service_in_thread
+            stop_telegram_service_in_thread(timeout=5.0)
+        except Exception:
+            pass
+
+        # Detener el hilo de logs (sus mensajes ya no se escriben en la GUI)
+        self._stop_log_thread = True
+        log_thread = getattr(self, "_log_thread", None)
+        if log_thread is not None:
+            try:
+                if log_thread.is_alive():
+                    log_thread.join(timeout=1.0)
+            except Exception:
+                pass
+
+        # Limpieza final de puertos: red de seguridad por si algún hijo quedó
+        # huérfano (p. ej. un llama-server que no respondió al terminate).
+        ports = list(self.SHUTDOWN_PORTS)
+        if AUTOMATION_PORT not in ports:
+            ports.append(AUTOMATION_PORT)
+        for port in ports:
+            try:
+                if process_manager.is_port_in_use(port):
+                    process_manager.stop_server(port=port, wait=1.0)
+            except Exception:
+                pass
+
+    def _arm_shutdown_watchdog(self):
+        """Red de seguridad: fuerza la salida del exe si el cierre ordenado se cuelga."""
+        if getattr(self, "_shutdown_watchdog", False):
+            return
+        self._shutdown_watchdog = True
+
+        def _watchdog():
+            try:
+                time.sleep(self.SHUTDOWN_GRACE_SECONDS)
+            except Exception:
+                return
+            try:
+                self.log("⚠️ El cierre excedió el tiempo límite; forzando salida.")
+            except Exception:
+                pass
+            self._force_exit_process(code=1)
+
+        try:
+            threading.Thread(target=_watchdog, name="shutdown-watchdog", daemon=True).start()
+        except Exception:
+            pass
+
+    def _force_exit_process(self, code=0):
+        """Salida dura del ejecutable principal tras vaciar los buffers de salida.
+
+        Se usa al FINAL de un cierre ordenado (y como red de seguridad del
+        watchdog). Garantiza que el exe principal no se quede colgado con hilos
+        no-daemon o el bucle de Tk aún vivo.
+        """
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            import logging as _logging
+            _logging.shutdown()
+        except Exception:
+            pass
+        os._exit(code)
+
     def on_close(self):
+        """Cierra la aplicación por completo: servicios, bandeja, GUI y proceso.
+
+        Se invoca desde el botón de cerrar ventana (`WM_DELETE_WINDOW`), desde
+        "Salir" de la bandeja, desde el handler de consola (CTRL_C/CTRL_CLOSE) y
+        desde `atexit`. Es idempotente: las llamadas posteriores no repiten el
+        cierre. Todo el trabajo de parada está acotado en el tiempo por
+        `_arm_shutdown_watchdog`, de modo que el exe principal siempre termina.
+        """
         if getattr(self, '_closing', False):
             return
+        self._closing = True
         try:
-            self._closing = True
             self.log("🛑 Cerrando aplicación, deteniendo todos los servicios...")
+        except Exception:
+            pass
 
-            # Orden de cierre: visor, chat, embeddings, MCP, RAG, Piper, Config
-            if self.viewer_process:
-                try:
-                    process_manager.close_process_gracefully(self.viewer_process, timeout=3.0)
-                except:
-                    pass
-                self.viewer_process = None
+        # Ocultar la ventana cuanto antes para dar feedback visual del cierre.
+        try:
+            self.withdraw()
+        except Exception:
+            pass
 
-            if self.chat_process:
-                try:
-                    process_manager.stop_server(self.chat_process, port=8081, wait=2.0)
-                except:
-                    pass
-                self.chat_process = None
+        # Red de seguridad desde el primer momento.
+        self._arm_shutdown_watchdog()
 
-            if self.embedding_process:
-                try:
-                    process_manager.stop_server(self.embedding_process, port=8082, wait=2.5)
-                except:
-                    pass
-                self.embedding_process = None
-
-            self.stop_dev_agent(wait=True)
-            self.stop_officecli()
-            self.stop_workspace_server(wait=True)
-            self.stop_rag_service(force=True)
-            self.stop_piper_service()
-            
-            # Detener servidor de configuración
-            try:
-                from tools.config_server import stop_config_server
-                stop_config_server()
-            except:
-                pass
-            
-            # Detener servicio de Telegram
-            try:
-                from tools.telegram_service import stop_telegram_service_in_thread
-                stop_telegram_service_in_thread(timeout=5.0)
-            except:
-                pass
-            
-            self._stop_log_thread = True
-            if self._log_thread and self._log_thread.is_alive():
-                self._log_thread.join(timeout=1.0)
-
-            # Limpieza final de puertos
-            for port in [15000, 8081, 8082, 25000, 5000, 5001, 8880, 19000]:
-                try:
-                    if process_manager.is_port_in_use(port):
-                        process_manager.stop_server(port=port, wait=1.0)
-                except:
-                    pass
-
-            self.destroy()
-            self.log("✅ Aplicación cerrada correctamente.")
+        try:
+            self._stop_all_services()
         except Exception as e:
-            self.log(f"Error en on_close: {e}")
+            try:
+                self.log(f"Error deteniendo servicios en on_close: {e}")
+            except Exception:
+                pass
+
+        # Bandeja del sistema
+        tray = getattr(self, "tray_icon", None)
+        if tray is not None:
+            try:
+                tray.visible = False
+            except Exception:
+                pass
+            try:
+                tray.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
+
+        try:
+            self.log("✅ Aplicación cerrada correctamente.")
+        except Exception:
+            pass
+
+        # Destruir la GUI (mejor esfuerzo; puede fallar si venimos de otro hilo).
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+        # Salida definitiva del exe principal: sin hijos huérfanos ni procesos
+        # zombis del propio manager.
+        self._force_exit_process(code=0)
 
     # ---------- OTRAS UTILIDADES ----------
     # `_mmproj_args` ya NO se define aquí: vive en `LlamaCommandMixin`
@@ -3781,8 +4086,10 @@ def run_subcommand():
         from tools.web_viewer import main as web_viewer_main
         sys.exit(web_viewer_main())
     elif cmd == "--web-only":
+        # Sin GUI no hay manager Tk: el propio panel web es el dueño del
+        # servicio 24/7, así que lo arranca él (y su watchdog apunta a él).
         from tools.web_manager_server import start_web_server
-        start_web_server(host="0.0.0.0", port=WEB_MANAGER_PORT)
+        start_web_server(host="0.0.0.0", port=WEB_MANAGER_PORT, ensure_automation=True)
         sys.exit(0)
     elif cmd == "--run-mcp-server":
         # Se reutiliza el parser de tools/dev_agent.py para que las banderas del
@@ -3822,6 +4129,12 @@ def run_subcommand():
         from tools.rag_web_server import main as rag_main
         rag_main()
         sys.exit(0)
+    elif cmd == "--run-automation-service":
+        # Servicio 24/7 (dispatchers, cola y webhooks). El manager lo arranca
+        # con `--parent-pid`: el watchdog lo cierra si el manager desaparece.
+        from tools.automation_service import main as automation_main
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        sys.exit(automation_main())
     elif cmd == "--run-workspace-server":
         from tools.workspace_server import main as workspace_main
         # argparse dentro de workspace_server debe ver SOLO sus propios args,
@@ -3890,14 +4203,14 @@ if __name__ == "__main__":
             "   Este ejecutable no actúa como intérprete Python por defecto.\n"
             "   Subcomandos: --run-python-code, --run-python-script <archivo.py>,\n"
             "   --run-cli, --run-mcp-server, --run-piper-server, --run-rag-server,\n"
-            "   --run-workspace-server, --run-web-viewer, --web-only\n"
+            "   --run-workspace-server, --run-automation-service, --run-web-viewer, --web-only\n"
             "   (No se abre la GUI para evitar una segunda instancia.)\n"
         )
         sys.exit(2)
     elif not HAS_GUI:
         print(f"🖥️ Entorno sin GUI detectado. Abre http://127.0.0.1:{WEB_MANAGER_PORT}")
         from tools.web_manager_server import start_web_server
-        start_web_server(host="0.0.0.0", port=WEB_MANAGER_PORT)
+        start_web_server(host="0.0.0.0", port=WEB_MANAGER_PORT, ensure_automation=True)
     elif "--service" in sys.argv and os.name != 'nt':
         # Modo servicio: sin ventana, solo tray + procesos background
         import multiprocessing
@@ -3913,6 +4226,8 @@ if __name__ == "__main__":
                 self._reserved_ports = set()
                 self._reserved_lock = threading.Lock()
                 self.rag_server_process = None
+                self.piper_process = None
+                self.officecli_process = None
                 self._closing = False
                 self.is_tray_minimized = False
 
@@ -3969,31 +4284,35 @@ if __name__ == "__main__":
                 if getattr(self, '_closing', False):
                     return
                 self._closing = True
-                self.log("🛑 Cerrando servicio...")
-                if self.chat_process:
-                    process_manager.stop_server(self.chat_process, port=8081, wait=2.0)
-                if self.embedding_process:
-                    process_manager.stop_server(self.embedding_process, port=8082, wait=2.5)
-                self.stop_dev_agent(wait=True)
-                self.stop_workspace_server(wait=True)
-                self.stop_rag_service(force=True)
                 try:
-                    from tools.telegram_service import stop_telegram_service_in_thread
-                    stop_telegram_service_in_thread(timeout=5.0)
-                except:
+                    self.log("🛑 Cerrando servicio...")
+                except Exception:
                     pass
-                self._stop_log_thread = True
-                if self._log_thread and self._log_thread.is_alive():
-                    self._log_thread.join(timeout=1.0)
-                for port in [15000, 8081, 8082, 25000, 19000]:
-                    if process_manager.is_port_in_use(port):
-                        process_manager.stop_server(port=port, wait=1.0)
-                self.log("✅ Servicio detenido")
-                if self.tray_icon:
+                # Misma parada ordenada y red de seguridad que la GUI.
+                self._arm_shutdown_watchdog()
+                try:
+                    self._stop_all_services()
+                except Exception as e:
                     try:
-                        self.tray_icon.stop()
-                    except:
+                        self.log(f"Error deteniendo servicios: {e}")
+                    except Exception:
                         pass
+                tray = getattr(self, 'tray_icon', None)
+                if tray is not None:
+                    try:
+                        tray.visible = False
+                    except Exception:
+                        pass
+                    try:
+                        tray.stop()
+                    except Exception:
+                        pass
+                    self.tray_icon = None
+                try:
+                    self.log("✅ Servicio detenido")
+                except Exception:
+                    pass
+                self._force_exit_process(code=0)
 
             # Evitar métodos que requieren GUI
             def create_widgets(self): pass

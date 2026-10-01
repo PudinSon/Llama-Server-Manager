@@ -414,7 +414,11 @@ class AutomationDispatcher:
         error: Optional[str] = None
         try:
             result = str(
-                self._orchestrator_for(worker_id).run_autonomous_task(prompt, reasoning=True) or ""
+                self._orchestrator_for(worker_id).run_autonomous_task(
+                    prompt,
+                    reasoning=True,
+                    context=self.build_context(task),
+                ) or ""
             )
         except Exception as exc:
             error = str(exc)
@@ -587,22 +591,26 @@ class AutomationDispatcher:
     def build_prompt(self, task: Dict[str, Any]) -> str:
         """Compone la instrucción para el agente a partir de la tarea."""
         wake_prompt = str(task.get("wake_prompt") or "").strip()
-        payload = task.get("payload")
         template = str(task.get("agent_template") or "").strip()
 
-        parts: List[str] = []
-        if wake_prompt:
-            parts.append(wake_prompt)
-        if payload not in (None, "", {}, []):
-            if not isinstance(payload, str):
-                payload = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
-            parts.append(f"[EVENTO]\n{payload}")
-        prompt = "\n\n".join(parts).strip()
+        prompt = wake_prompt
         if not prompt:
             prompt = f"Procesa el evento {task.get('source')}:{task.get('source_ref') or task.get('id')}"
         if template:
             prompt = f"{template}\n\n{prompt}"
         return prompt
+
+    def build_context(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """Mantiene payload de eventos fuera del objetivo y las subtareas."""
+        context: Dict[str, Any] = {}
+        payload = task.get("payload")
+        if payload not in (None, "", {}, []):
+            context["event"] = payload
+        source = task.get("source")
+        source_ref = task.get("source_ref")
+        if source or source_ref:
+            context["event_metadata"] = {"source": source, "source_ref": source_ref}
+        return context
 
     def _describe(self, task: Dict[str, Any]) -> str:
         base = str(task.get("wake_prompt") or "").strip() or str(task.get("source") or "evento")

@@ -101,6 +101,10 @@
 
 			{#if gauge.hasAnyUsage}
 				<ContextGaugeDetails
+					agentCacheTotal={gauge.agentCacheTotal}
+					agentOutputTokens={gauge.agentOutputTokens}
+					agentPromptTokens={gauge.agentPromptTokens}
+					agentTokens={gauge.agentTokens}
 					currentRead={gauge.currentRead}
 					currentFresh={gauge.currentFresh}
 					currentCache={gauge.currentCache}

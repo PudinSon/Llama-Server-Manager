@@ -1,6 +1,7 @@
 <script lang="ts">
-	import { Workflow } from '@lucide/svelte';
+	import { TriangleAlert, Workflow } from '@lucide/svelte';
 	import { toast } from 'svelte-sonner';
+	import { serviceBase } from '$lib/api';
 	import { Button } from '$lib/components/ui/button';
 	import {
 		approveAutomationTask,
@@ -9,6 +10,10 @@
 		deleteFileWatch,
 		dispatchAutomationOnce,
 		enqueueAutomationTask,
+		beginGoogleMailLink,
+		disconnectGoogleMail,
+		getAutomationGmailConfig,
+		getAutomationImapConfig,
 		getAutomationStatus,
 		getExecutorStatus,
 		listAutomationAudit,
@@ -20,6 +25,7 @@
 		listFileWatches,
 		pauseDispatcher,
 		pauseExecutor,
+		pollAutomationGmail,
 		pollAutomationImapNow,
 		rejectAutomationTask,
 		retryAutomationTask,
@@ -27,10 +33,13 @@
 		resumeExecutor,
 		rotateAutomationWebhookToken,
 		runCron,
+		saveAutomationImapConfig,
+		saveAutomationGmailConfig,
 		saveAutomationWebhook,
 		saveCron,
 		saveFileWatch,
 		scanFileWatch,
+		testAutomationImapConnection,
 		webhookIngestUrl,
 		type AutomationAuditEntry,
 		type AutomationCron,
@@ -38,6 +47,8 @@
 		type AutomationExecutorStatus,
 		type AutomationFileWatch,
 		type AutomationHistoryEntry,
+		type AutomationGmailConfig,
+		type AutomationImapConfig,
 		type AutomationImapStatus,
 		type AutomationTask,
 		type AutomationTaskStatus,
@@ -63,14 +74,34 @@
 	let tasks = $state<AutomationTask[]>([]);
 	let audit = $state<AutomationAuditEntry[]>([]);
 	let imap = $state<AutomationImapStatus | null>(null);
-	let dispatcher = $state<Awaited<ReturnType<typeof getAutomationStatus>>['dispatcher'] | null>(null);
+	let imapConfig = $state<AutomationImapConfig | null>(null);
+	let gmailStatus = $state<AutomationGmailConfig | null>(null);
+	let gmailConfig = $state<AutomationGmailConfig | null>(null);
+	let gmailClientId = $state('');
+	let gmailClientSecret = $state('');
+	let gmailBusy = $state(false);
+	let imapPassword = $state('');
+	let imapBusy = $state(false);
+	let gmailConfigLoaded = false;
+	let gmailConfigLoading = false;
+	let imapConfigLoaded = false;
+	let imapConfigLoading = false;
+	let dispatcher = $state<Awaited<ReturnType<typeof getAutomationStatus>>['dispatcher'] | null>(
+		null
+	);
 
 	let loading = $state(false);
 	let connected = $state(false);
+	/**
+	 * URL del servicio 24/7 para el aviso de «sin conexión». El servicio lo
+	 * arranca el Manager como proceso hijo (Configuración Avanzada → servicio de
+	 * automatización 24/7) y solo se para con él: cerrar la web view no lo
+	 * detiene. Si aquí no hay conexión es que el Manager no está corriendo o el
+	 * servicio está desactivado.
+	 */
+	const serviceEndpoint = $derived(serviceBase('automation') || `puerto 15001`);
 	let statusFilter = $state('');
-	let tab = $state<'dispatchers' | 'tasks' | 'audit' | 'webhooks' | 'filewatch' | 'cron'>(
-		'tasks'
-	);
+	let tab = $state<'dispatchers' | 'tasks' | 'audit' | 'webhooks' | 'filewatch' | 'cron'>('tasks');
 	let busyId = $state<number | null>(null);
 	let newPrompt = $state('');
 	let newSource = $state('manual');
@@ -136,8 +167,20 @@
 			]);
 			dispatcher = status.dispatcher;
 			imap = status.imap ?? null;
+			gmailStatus = status.gmail ?? null;
+			if (gmailConfig && status.gmail) {
+				gmailConfig = {
+					...gmailConfig,
+					connected: status.gmail.connected,
+					address: status.gmail.address,
+					has_client_secret: status.gmail.has_client_secret,
+					running: status.gmail.running
+				};
+			}
 			tasks = listing.tasks;
 			connected = true;
+			if (!imapConfigLoaded) await loadImapConfig();
+			if (!gmailConfigLoaded) await loadGmailConfig();
 			if (tab === 'audit') audit = (await listAutomationAudit({ limit: 100 })).entries;
 		} catch (error) {
 			connected = false;
@@ -390,9 +433,7 @@
 		try {
 			const result = await scanFileWatch(name);
 			toast.success(
-				result.enqueued
-					? `${result.enqueued} archivo(s) encolado(s)`
-					: 'Sin archivos nuevos'
+				result.enqueued ? `${result.enqueued} archivo(s) encolado(s)` : 'Sin archivos nuevos'
 			);
 			await loadFileWatches();
 		} catch (error) {
@@ -491,6 +532,127 @@
 		await run(() => pollAutomationImapNow(), 'Sondeo IMAP solicitado');
 	}
 
+	async function loadImapConfig() {
+		if (imapConfigLoaded || imapConfigLoading) return;
+		imapConfigLoading = true;
+		try {
+			imapConfig = (await getAutomationImapConfig()).config;
+			imapConfigLoaded = true;
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : String(error));
+		} finally {
+			imapConfigLoading = false;
+		}
+	}
+
+	async function handleSaveImapConfig() {
+		if (!imapConfig) return;
+		imapBusy = true;
+		try {
+			const result = await saveAutomationImapConfig({
+				...imapConfig,
+				password: imapPassword || undefined
+			});
+			imapConfig = result.config;
+			imapPassword = '';
+			toast.success('Configuración de correo guardada');
+			await refresh();
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : String(error));
+		} finally {
+			imapBusy = false;
+		}
+	}
+
+	async function handleTestImapConnection() {
+		imapBusy = true;
+		try {
+			const result = await testAutomationImapConnection();
+			toast.success(`Conexión IMAP correcta · ${result.folder ?? imapConfig?.folder ?? 'INBOX'}`);
+			await refresh();
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : String(error));
+		} finally {
+			imapBusy = false;
+		}
+	}
+
+	async function loadGmailConfig() {
+		if (gmailConfigLoaded || gmailConfigLoading) return;
+		gmailConfigLoading = true;
+		try {
+			gmailConfig = (await getAutomationGmailConfig()).config;
+			gmailClientId = gmailConfig.client_id;
+			gmailConfigLoaded = true;
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : String(error));
+		} finally {
+			gmailConfigLoading = false;
+		}
+	}
+
+	async function handleStartGoogleLink() {
+		const popup = window.open('about:blank', '_blank');
+		gmailBusy = true;
+		try {
+			const result = await beginGoogleMailLink({
+				client_id: gmailClientId,
+				client_secret: gmailClientSecret || undefined
+			});
+			gmailClientSecret = '';
+			if (popup) popup.location.href = result.authorization_url;
+			else window.location.href = result.authorization_url;
+			toast.info('Completa el acceso y la verificación en dos pasos en Google.');
+		} catch (error) {
+			popup?.close();
+			toast.error(error instanceof Error ? error.message : String(error));
+		} finally {
+			gmailBusy = false;
+		}
+	}
+
+	async function handleSaveGmailConfig() {
+		if (!gmailConfig) return;
+		gmailBusy = true;
+		try {
+			const result = await saveAutomationGmailConfig({
+				enabled: gmailConfig.enabled,
+				search: gmailConfig.search,
+				poll_interval: gmailConfig.poll_interval,
+				mark_seen: gmailConfig.mark_seen,
+				max_per_poll: gmailConfig.max_per_poll,
+				wake_prompt: gmailConfig.wake_prompt,
+				agent_template: gmailConfig.agent_template
+			});
+			gmailConfig = result.config;
+			toast.success('Configuración Gmail guardada');
+			await refresh();
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : String(error));
+		} finally {
+			gmailBusy = false;
+		}
+	}
+
+	async function handleDisconnectGoogle() {
+		if (!window.confirm('¿Desvincular la cuenta de Google? Se detendrá el sondeo de Gmail.'))
+			return;
+		gmailBusy = true;
+		try {
+			gmailConfig = (await disconnectGoogleMail()).config;
+			toast.success('Cuenta Google desvinculada');
+			await refresh();
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : String(error));
+		} finally {
+			gmailBusy = false;
+		}
+	}
+
+	async function handlePollGmail() {
+		await run(() => pollAutomationGmail(), 'Sondeo Gmail solicitado');
+	}
+
 	function formatTime(epoch?: number | null): string {
 		if (!epoch) return '—';
 		return new Date(epoch * 1000).toLocaleString();
@@ -515,6 +677,7 @@
 
 	$effect(() => {
 		void refresh();
+		void loadImapConfig();
 		const timer = setInterval(() => void refresh(), REFRESH_MS);
 		return () => clearInterval(timer);
 	});
@@ -553,16 +716,27 @@
 		</div>
 	</header>
 
+	{#if !connected && !loading}
+		<div
+			class="mb-6 flex items-start gap-3 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm"
+		>
+			<TriangleAlert class="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+			<div class="flex flex-col gap-1">
+				<span class="font-medium">Sin conexión con el servicio de automatización</span>
+				<span class="text-muted-foreground">
+					El servicio 24/7 (dispatchers, cola y webhooks) lo arranca el Manager como proceso hijo y
+					se detiene con él, así que sin Manager no hay modelo ni tareas que ejecutar. Corre aparte
+					de esta ventana: cerrar la web view no lo detiene. Actívalo en el Manager → Configuración
+					Avanzada → «Activar servicio de automatización 24/7».
+				</span>
+				<span class="font-mono text-xs text-muted-foreground">{serviceEndpoint}</span>
+			</div>
+		</div>
+	{/if}
+
 	{#if dispatcher}
 		<section class="mb-6 grid grid-cols-2 gap-3 md:grid-cols-6">
-			{#each [
-				{ label: 'Pendientes', value: dispatcher.queue.pending },
-				{ label: 'En curso', value: dispatcher.queue.running },
-				{ label: 'Aprobación', value: dispatcher.queue.awaiting_approval },
-				{ label: 'Hechas', value: dispatcher.queue.done },
-				{ label: 'Fallidas', value: dispatcher.queue.failed },
-				{ label: 'Reintentos', value: dispatcher.retried }
-			] as card (card.label)}
+			{#each [{ label: 'Pendientes', value: dispatcher.queue.pending }, { label: 'En curso', value: dispatcher.queue.running }, { label: 'Aprobación', value: dispatcher.queue.awaiting_approval }, { label: 'Hechas', value: dispatcher.queue.done }, { label: 'Fallidas', value: dispatcher.queue.failed }, { label: 'Reintentos', value: dispatcher.retried }] as card (card.label)}
 				<div class="rounded-lg border border-border p-3">
 					<p class="text-xs text-muted-foreground">{card.label}</p>
 					<p class="text-xl font-semibold">{card.value}</p>
@@ -651,10 +825,18 @@
 		>
 			Disparadores
 		</Button>
-		<Button variant={tab === 'tasks' ? 'default' : 'outline'} size="sm" onclick={() => (tab = 'tasks')}>
+		<Button
+			variant={tab === 'tasks' ? 'default' : 'outline'}
+			size="sm"
+			onclick={() => (tab = 'tasks')}
+		>
 			Tareas
 		</Button>
-		<Button variant={tab === 'audit' ? 'default' : 'outline'} size="sm" onclick={() => (tab = 'audit')}>
+		<Button
+			variant={tab === 'audit' ? 'default' : 'outline'}
+			size="sm"
+			onclick={() => (tab = 'audit')}
+		>
 			Auditoría
 		</Button>
 		<Button
@@ -693,7 +875,9 @@
 
 	{#if tab === 'tasks'}
 		{#if tasks.length === 0}
-			<p class="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
+			<p
+				class="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground"
+			>
 				No hay tareas para este filtro.
 			</p>
 		{:else}
@@ -734,11 +918,17 @@
 										</span>
 									{/if}
 								</td>
-								<td class="px-3 py-2 text-xs text-muted-foreground">{formatTime(task.created_at)}</td>
+								<td class="px-3 py-2 text-xs text-muted-foreground"
+									>{formatTime(task.created_at)}</td
+								>
 								<td class="px-3 py-2 text-right">
 									{#if task.status === 'awaiting_approval'}
 										<span class="flex justify-end gap-2">
-											<Button size="sm" disabled={busyId === task.id} onclick={() => handleApprove(task)}>
+											<Button
+												size="sm"
+												disabled={busyId === task.id}
+												onclick={() => handleApprove(task)}
+											>
 												Aprobar
 											</Button>
 											<Button
@@ -796,14 +986,18 @@
 										{webhook.enabled ? 'activo' : 'deshabilitado'}
 									</span>
 									{#if webhook.allow_anonymous}
-										<span class="rounded-full bg-amber-500/15 px-2 py-0.5 text-xs text-amber-600 dark:text-amber-400">
+										<span
+											class="rounded-full bg-amber-500/15 px-2 py-0.5 text-xs text-amber-600 dark:text-amber-400"
+										>
 											anónimo (solo loopback)
 										</span>
 									{:else if webhook.has_token}
 										<span class="rounded-full bg-secondary px-2 py-0.5 text-xs">con token</span>
 									{/if}
 									{#if webhook.requires_approval}
-										<span class="rounded-full bg-secondary px-2 py-0.5 text-xs">requiere aprobación</span>
+										<span class="rounded-full bg-secondary px-2 py-0.5 text-xs"
+											>requiere aprobación</span
+										>
 									{/if}
 								</div>
 								<p class="mt-1 truncate font-mono text-xs text-muted-foreground">
@@ -820,10 +1014,18 @@
 									<Button size="sm" variant="outline" onclick={() => handleEditWebhook(webhook)}>
 										Editar
 									</Button>
-									<Button size="sm" variant="outline" onclick={() => handleRotateWebhook(webhook.name)}>
+									<Button
+										size="sm"
+										variant="outline"
+										onclick={() => handleRotateWebhook(webhook.name)}
+									>
 										Rotar token
 									</Button>
-									<Button size="sm" variant="outline" onclick={() => handleDeleteWebhook(webhook.name)}>
+									<Button
+										size="sm"
+										variant="outline"
+										onclick={() => handleDeleteWebhook(webhook.name)}
+									>
 										Eliminar
 									</Button>
 								</div>
@@ -852,7 +1054,9 @@
 
 			<section class="rounded-lg border border-border p-4">
 				<h2 class="mb-3 text-sm font-semibold">
-					{webhookForm.name.trim() ? `Editar «${webhookForm.name.trim().toLowerCase()}»` : 'Nuevo webhook'}
+					{webhookForm.name.trim()
+						? `Editar «${webhookForm.name.trim().toLowerCase()}»`
+						: 'Nuevo webhook'}
 				</h2>
 				<div class="grid gap-3">
 					<label class="flex flex-col gap-1 text-xs">
@@ -865,7 +1069,7 @@
 					</label>
 					<label class="flex flex-col gap-1 text-xs">
 						<span class="text-muted-foreground">
-							Prompt (admite campos del cuerpo, p. ej. {"{action}"})
+							Prompt (admite campos del cuerpo, p. ej. {'{action}'})
 						</span>
 						<textarea
 							class="rounded-md border border-border bg-background px-2 py-1.5 text-sm"
@@ -888,21 +1092,15 @@
 					</label>
 					<label class="flex items-center gap-2 text-xs">
 						<input type="checkbox" bind:checked={webhookForm.requires_approval} />
-						<span class="text-muted-foreground">
-							Exigir aprobación antes de ejecutar
-						</span>
+						<span class="text-muted-foreground"> Exigir aprobación antes de ejecutar </span>
 					</label>
 					<label class="flex items-center gap-2 text-xs">
 						<input type="checkbox" bind:checked={webhookForm.allow_anonymous} />
-						<span class="text-muted-foreground">
-							Permitir sin token (solo desde loopback)
-						</span>
+						<span class="text-muted-foreground"> Permitir sin token (solo desde loopback) </span>
 					</label>
 					<label class="flex items-center gap-2 text-xs">
 						<input type="checkbox" bind:checked={webhookForm.dedupe} />
-						<span class="text-muted-foreground">
-							Deduplicar por identificador de entrega
-						</span>
+						<span class="text-muted-foreground"> Deduplicar por identificador de entrega </span>
 					</label>
 					<div class="flex gap-2">
 						<Button size="sm" disabled={!webhookForm.name.trim()} onclick={handleSaveWebhook}>
@@ -947,13 +1145,21 @@
 									Último aviso: {item.last_run ? formatTime(item.last_run) : '—'}
 								</p>
 								<div class="mt-2 flex flex-wrap gap-2">
-									<Button size="sm" variant="outline" onclick={() => handleScanFileWatch(item.name)}>
+									<Button
+										size="sm"
+										variant="outline"
+										onclick={() => handleScanFileWatch(item.name)}
+									>
 										Escanear ahora
 									</Button>
 									<Button size="sm" variant="outline" onclick={() => handleEditFileWatch(item)}>
 										Editar
 									</Button>
-									<Button size="sm" variant="outline" onclick={() => handleDeleteFileWatch(item.name)}>
+									<Button
+										size="sm"
+										variant="outline"
+										onclick={() => handleDeleteFileWatch(item.name)}
+									>
 										Eliminar
 									</Button>
 								</div>
@@ -979,9 +1185,7 @@
 						/>
 					</label>
 					<label class="flex flex-col gap-1 text-xs">
-						<span class="text-muted-foreground">
-							Carpeta (absoluta o relativa al workspace)
-						</span>
+						<span class="text-muted-foreground"> Carpeta (absoluta o relativa al workspace) </span>
 						<input
 							class="rounded-md border border-border bg-background px-2 py-1.5 text-sm"
 							bind:value={filewatchForm.path}
@@ -1038,7 +1242,7 @@
 					</div>
 					<label class="flex flex-col gap-1 text-xs">
 						<span class="text-muted-foreground">
-							Prompt (admite {"{file}"}, {"{name}"}, {"{path}"}, {"{size}"})
+							Prompt (admite {'{file}'}, {'{name}'}, {'{path}'}, {'{size}'})
 						</span>
 						<textarea
 							class="rounded-md border border-border bg-background px-2 py-1.5 text-sm"
@@ -1174,7 +1378,7 @@
 					</p>
 					<label class="flex flex-col gap-1 text-xs">
 						<span class="text-muted-foreground">
-							Prompt (admite {"{date}"}, {"{time}"}, {"{weekday}"})
+							Prompt (admite {'{date}'}, {'{time}'}, {'{weekday}'})
 						</span>
 						<textarea
 							class="rounded-md border border-border bg-background px-2 py-1.5 text-sm"
@@ -1283,8 +1487,8 @@
 
 				<p class="mt-3 text-xs text-muted-foreground">
 					{#if executor.paused}
-						Los workers han dejado de reclamar tareas (la que estuviera en curso termina).
-						Al reanudar salen todas al instante.
+						Los workers han dejado de reclamar tareas (la que estuviera en curso termina). Al
+						reanudar salen todas al instante.
 						{#if executor.paused_reason}· Motivo: {executor.paused_reason}{/if}
 					{:else}
 						Consume la cola: los disparadores solo la alimentan. Reintentos hasta
@@ -1360,8 +1564,8 @@
 		</section>
 
 		<p class="mb-3 text-xs text-muted-foreground">
-			Pausar detiene la generación automática de tareas y sobrevive a un reinicio del servicio.
-			Las acciones manuales (escanear, ejecutar ahora, sondear el buzón) siguen disponibles.
+			Pausar detiene la generación automática de tareas y sobrevive a un reinicio del servicio. Las
+			acciones manuales (escanear, ejecutar ahora, sondear el buzón) siguen disponibles.
 		</p>
 
 		<div class="mb-3 flex flex-wrap items-center gap-2">
@@ -1378,7 +1582,9 @@
 		</div>
 
 		{#if history.length === 0}
-			<p class="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
+			<p
+				class="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground"
+			>
 				Sin eventos registrados todavía.
 			</p>
 		{:else}
@@ -1398,7 +1604,9 @@
 							<tr class="border-t border-border">
 								<td class="px-3 py-2 text-xs text-muted-foreground">{formatTime(entry.at)}</td>
 								<td class="px-3 py-2">
-									<span class="rounded-full bg-secondary px-2 py-0.5 text-xs">{entry.kind || '—'}</span>
+									<span class="rounded-full bg-secondary px-2 py-0.5 text-xs"
+										>{entry.kind || '—'}</span
+									>
 								</td>
 								<td class="px-3 py-2">{entry.action}</td>
 								<td class="px-3 py-2 font-mono text-xs">
@@ -1413,7 +1621,9 @@
 		{/if}
 	{:else}
 		{#if audit.length === 0}
-			<p class="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
+			<p
+				class="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground"
+			>
 				Sin registros de auditoría.
 			</p>
 		{:else}
@@ -1432,31 +1642,366 @@
 		{/if}
 	{/if}
 
-	<section class="mt-6 rounded-lg border border-border p-4 text-sm">
-		<h2 class="mb-2 text-sm font-semibold">📥 Correo (IMAP)</h2>
-		{#if imap && (imap.enabled === undefined || imap.enabled)}
-			<dl class="grid grid-cols-2 gap-2 text-xs md:grid-cols-4">
+	{#if imapConfig}
+		<section class="mt-6 space-y-4 rounded-lg border border-border p-4 text-sm">
+			<header class="flex flex-wrap items-start justify-between gap-3">
 				<div>
-					<dt class="text-muted-foreground">Carpeta</dt>
-					<dd>{imap.folder ?? 'INBOX'}</dd>
+					<h2 class="text-sm font-semibold">Correo entrante</h2>
+					<p class="mt-1 text-xs text-muted-foreground">
+						Conecta un buzón IMAP para convertir correos nuevos en tareas de la cola.
+					</p>
 				</div>
+				<span class="rounded-sm border border-border px-2 py-1 text-[11px] font-medium">
+					{imapConfig.running
+						? 'Escuchando'
+						: imapConfig.enabled
+							? 'Activado · detenido'
+							: 'Desactivado'}
+				</span>
+			</header>
+
+			<div class="grid min-w-0 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+				<label class="flex min-w-0 flex-col gap-1 text-xs sm:col-span-2">
+					<span class="text-muted-foreground">Servidor IMAP</span>
+					<input
+						class="rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+						bind:value={imapConfig.host}
+						placeholder="imap.gmail.com"
+						autocomplete="url"
+					/>
+				</label>
+				<label class="flex min-w-0 flex-col gap-1 text-xs">
+					<span class="text-muted-foreground">Puerto</span>
+					<input
+						class="rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+						type="number"
+						min="1"
+						max="65535"
+						bind:value={imapConfig.port}
+					/>
+				</label>
+				<label class="flex min-w-0 flex-col gap-1 text-xs sm:col-span-2">
+					<span class="text-muted-foreground">Usuario / correo</span>
+					<input
+						class="rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+						bind:value={imapConfig.user}
+						autocomplete="username"
+						placeholder="tu@correo.com"
+					/>
+				</label>
+				<label class="flex min-w-0 flex-col gap-1 text-xs sm:col-span-2">
+					<span class="text-muted-foreground"
+						>Contraseña{imapConfig.has_password ? ' · guardada' : ''}</span
+					>
+					<input
+						class="rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+						type="password"
+						bind:value={imapPassword}
+						autocomplete="new-password"
+						placeholder={imapConfig.has_password
+							? 'Vacío para conservar la actual'
+							: 'Contraseña o clave de aplicación'}
+					/>
+				</label>
+				<p class="sm:col-span-4 -mt-1 text-[11px] leading-relaxed text-muted-foreground">
+					Si tu proveedor usa verificación en dos pasos, genera allí una contraseña de aplicación y
+					úsala aquí. Los códigos temporales TOTP no son un método de acceso IMAP estándar.
+				</p>
+				<label class="flex min-w-0 flex-col gap-1 text-xs">
+					<span class="text-muted-foreground">Carpeta</span>
+					<input
+						class="rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+						bind:value={imapConfig.folder}
+						placeholder="INBOX"
+					/>
+				</label>
+				<label class="flex min-w-0 flex-col gap-1 text-xs">
+					<span class="text-muted-foreground">Buscar mensajes</span>
+					<input
+						class="rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+						bind:value={imapConfig.search}
+						placeholder="UNSEEN"
+					/>
+				</label>
+				<label class="flex min-w-0 flex-col gap-1 text-xs">
+					<span class="text-muted-foreground">Intervalo (segundos)</span>
+					<input
+						class="rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+						type="number"
+						min="5"
+						max="86400"
+						bind:value={imapConfig.poll_interval}
+					/>
+				</label>
+				<label class="flex min-w-0 flex-col gap-1 text-xs">
+					<span class="text-muted-foreground">Máximo por sondeo</span>
+					<input
+						class="rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+						type="number"
+						min="1"
+						max="1000"
+						bind:value={imapConfig.max_per_poll}
+					/>
+				</label>
+			</div>
+
+			<div class="flex flex-wrap gap-x-5 gap-y-2 border-y border-border/60 py-3">
+				<label class="flex items-center gap-2 text-xs">
+					<input type="checkbox" bind:checked={imapConfig.enabled} />
+					<span>Activar escucha de correo</span>
+				</label>
+				<label class="flex items-center gap-2 text-xs">
+					<input type="checkbox" bind:checked={imapConfig.use_ssl} />
+					<span>Conexión SSL</span>
+				</label>
+				<label class="flex items-center gap-2 text-xs">
+					<input type="checkbox" bind:checked={imapConfig.mark_seen} />
+					<span>Marcar correo como leído al procesarlo</span>
+				</label>
+			</div>
+
+			<details class="group">
+				<summary class="cursor-pointer text-xs font-medium text-muted-foreground"
+					>Instrucciones para el agente</summary
+				>
+				<div class="mt-3 grid gap-3 md:grid-cols-2">
+					<label class="flex min-w-0 flex-col gap-1 text-xs">
+						<span class="text-muted-foreground">Prompt de activación</span>
+						<textarea
+							class="min-h-20 resize-y rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+							bind:value={imapConfig.wake_prompt}
+							placeholder="Procesa el correo entrante"
+						></textarea>
+					</label>
+					<label class="flex min-w-0 flex-col gap-1 text-xs">
+						<span class="text-muted-foreground">Instrucciones adicionales</span>
+						<textarea
+							class="min-h-20 resize-y rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+							bind:value={imapConfig.agent_template}
+							placeholder="Criterios o instrucciones para procesar correos"
+						></textarea>
+					</label>
+				</div>
+			</details>
+
+			{#if imap?.last_error}
+				<p
+					class="break-words rounded border border-destructive/20 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+				>
+					{imap.last_error}
+				</p>
+			{/if}
+			<div class="flex flex-wrap items-center justify-between gap-2">
+				<p class="text-[11px] text-muted-foreground">
+					Último sondeo: {formatTime(imap?.last_poll?.at ?? null)}
+				</p>
+				<div class="flex flex-wrap gap-2">
+					<Button
+						variant="outline"
+						size="sm"
+						disabled={imapBusy || !imapConfig.configured}
+						onclick={handleTestImapConnection}
+					>
+						Probar conexión
+					</Button>
+					<Button variant="outline" size="sm" disabled={imapBusy} onclick={handlePollImap}>
+						Sondear ahora
+					</Button>
+					<Button size="sm" disabled={imapBusy} onclick={handleSaveImapConfig}>
+						{imapBusy ? 'Guardando…' : 'Guardar configuración'}
+					</Button>
+				</div>
+			</div>
+		</section>
+	{/if}
+
+	{#if gmailConfig}
+		<section class="mt-4 space-y-4 rounded-lg border border-border p-4 text-sm">
+			<header class="flex flex-wrap items-start justify-between gap-3">
 				<div>
-					<dt class="text-muted-foreground">Último sondeo</dt>
-					<dd>{formatTime(imap.last_poll ?? null)}</dd>
+					<h2 class="text-sm font-semibold">Gmail con Google</h2>
+					<p class="mt-1 text-xs text-muted-foreground">
+						Vincula la cuenta con OAuth. La verificación en dos pasos se completa en la página
+						oficial de Google.
+					</p>
 				</div>
-				<div class="col-span-2">
-					<dt class="text-muted-foreground">Último error</dt>
-					<dd>{imap.last_error ?? '—'}</dd>
+				<span class="rounded-sm border border-border px-2 py-1 text-[11px] font-medium">
+					{gmailStatus?.running
+						? 'Escuchando'
+						: gmailConfig.connected
+							? gmailConfig.enabled
+								? 'Vinculado · detenido'
+								: 'Vinculado · desactivado'
+							: 'Sin vincular'}
+				</span>
+			</header>
+
+			{#if !gmailConfig.connected}
+				<div class="grid min-w-0 gap-3 md:grid-cols-2">
+					<label class="flex min-w-0 flex-col gap-1 text-xs">
+						<span class="text-muted-foreground">Google OAuth Client ID</span>
+						<input
+							class="rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+							bind:value={gmailClientId}
+							placeholder="...apps.googleusercontent.com"
+							autocomplete="off"
+						/>
+					</label>
+					<label class="flex min-w-0 flex-col gap-1 text-xs">
+						<span class="text-muted-foreground">
+							Client Secret{gmailConfig.has_client_secret ? ' · guardado' : ''}
+						</span>
+						<input
+							class="rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+							type="password"
+							bind:value={gmailClientSecret}
+							placeholder={gmailConfig.has_client_secret
+								? 'Vacío para conservar el guardado'
+								: 'Pega el secreto OAuth'}
+							autocomplete="new-password"
+						/>
+					</label>
 				</div>
-			</dl>
-			<Button class="mt-3" variant="outline" size="sm" onclick={handlePollImap}>
-				Probar sondeo
-			</Button>
-		{:else}
-			<p class="text-xs text-muted-foreground">
-				El listener IMAP no está activo en el servicio. Configúralo en el archivo de
-				configuración de la automatización y reinicia el servicio.
-			</p>
-		{/if}
-	</section>
+				<div
+					class="flex flex-wrap items-center justify-between gap-2 rounded border border-border/60 bg-muted/20 px-3 py-2"
+				>
+					<div class="min-w-0">
+						<p class="text-[11px] font-medium">URI de retorno autorizada</p>
+						<code class="break-all text-[10px] text-muted-foreground"
+							>{gmailConfig.redirect_uri}</code
+						>
+					</div>
+					<Button
+						variant="outline"
+						size="sm"
+						onclick={() => handleCopy(gmailConfig?.redirect_uri ?? '', 'URI de retorno')}
+					>
+						Copiar
+					</Button>
+				</div>
+				<p class="text-[11px] leading-relaxed text-muted-foreground">
+					En Google Cloud crea un OAuth Client ID de tipo aplicación web y añade esta URI de
+					retorno. Después pulsa Vincular; contraseña, passkey y códigos 2FA se introducen
+					directamente en Google, nunca aquí.
+				</p>
+			{/if}
+
+			{#if gmailConfig.connected}
+				<div
+					class="flex flex-wrap items-center justify-between gap-2 border-y border-border/60 py-3"
+				>
+					<div>
+						<p class="text-xs font-medium">Cuenta vinculada</p>
+						<p class="text-xs text-muted-foreground">{gmailConfig.address}</p>
+					</div>
+					<Button variant="outline" size="sm" disabled={gmailBusy} onclick={handleDisconnectGoogle}>
+						Desvincular Google
+					</Button>
+				</div>
+			{/if}
+
+			<div class="grid min-w-0 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+				<label class="flex min-w-0 flex-col gap-1 text-xs sm:col-span-2">
+					<span class="text-muted-foreground">Búsqueda de Gmail</span>
+					<input
+						class="rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+						bind:value={gmailConfig.search}
+						placeholder="is:unread"
+					/>
+				</label>
+				<label class="flex min-w-0 flex-col gap-1 text-xs">
+					<span class="text-muted-foreground">Intervalo (segundos)</span>
+					<input
+						class="rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+						type="number"
+						min="5"
+						max="86400"
+						bind:value={gmailConfig.poll_interval}
+					/>
+				</label>
+				<label class="flex min-w-0 flex-col gap-1 text-xs">
+					<span class="text-muted-foreground">Máximo por sondeo</span>
+					<input
+						class="rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+						type="number"
+						min="1"
+						max="1000"
+						bind:value={gmailConfig.max_per_poll}
+					/>
+				</label>
+			</div>
+
+			<div class="flex flex-wrap gap-x-5 gap-y-2 border-y border-border/60 py-3">
+				<label class="flex items-center gap-2 text-xs">
+					<input
+						type="checkbox"
+						bind:checked={gmailConfig.enabled}
+						disabled={!gmailConfig.connected}
+					/>
+					<span>Activar lectura de Gmail</span>
+				</label>
+				<label class="flex items-center gap-2 text-xs">
+					<input type="checkbox" bind:checked={gmailConfig.mark_seen} />
+					<span>Marcar procesados como leídos</span>
+				</label>
+			</div>
+
+			<details>
+				<summary class="cursor-pointer text-xs font-medium text-muted-foreground"
+					>Instrucciones para el agente</summary
+				>
+				<div class="mt-3 grid gap-3 md:grid-cols-2">
+					<label class="flex min-w-0 flex-col gap-1 text-xs">
+						<span class="text-muted-foreground">Prompt de activación</span>
+						<textarea
+							class="min-h-20 resize-y rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+							bind:value={gmailConfig.wake_prompt}
+							placeholder="Procesa el correo entrante"
+						></textarea>
+					</label>
+					<label class="flex min-w-0 flex-col gap-1 text-xs">
+						<span class="text-muted-foreground">Instrucciones adicionales</span>
+						<textarea
+							class="min-h-20 resize-y rounded-md border border-border bg-background px-2.5 py-2 text-sm"
+							bind:value={gmailConfig.agent_template}
+							placeholder="Criterios para procesar correos"
+						></textarea>
+					</label>
+				</div>
+			</details>
+
+			{#if gmailStatus?.last_error}
+				<p
+					class="break-words rounded border border-destructive/20 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+				>
+					{gmailStatus.last_error}
+				</p>
+			{/if}
+			<div class="flex flex-wrap items-center justify-between gap-2">
+				<p class="text-[11px] text-muted-foreground">
+					Último sondeo: {formatTime(gmailStatus?.last_poll?.at ?? null)}
+				</p>
+				<div class="flex flex-wrap gap-2">
+					{#if !gmailConfig.connected}
+						<Button
+							size="sm"
+							disabled={gmailBusy ||
+								!gmailClientId.trim() ||
+								(!gmailClientSecret && !gmailConfig.has_client_secret)}
+							onclick={handleStartGoogleLink}
+						>
+							{gmailBusy ? 'Abriendo Google…' : 'Vincular cuenta Google'}
+						</Button>
+					{:else}
+						<Button variant="outline" size="sm" disabled={gmailBusy} onclick={handlePollGmail}
+							>Sondear Gmail</Button
+						>
+					{/if}
+					<Button variant="outline" size="sm" disabled={gmailBusy} onclick={handleSaveGmailConfig}>
+						{gmailBusy ? 'Guardando…' : 'Guardar Gmail'}
+					</Button>
+				</div>
+			</div>
+		</section>
+	{/if}
 </div>

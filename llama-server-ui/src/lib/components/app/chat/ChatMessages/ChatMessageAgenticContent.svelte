@@ -1,6 +1,7 @@
 <script lang="ts">
 	import ChatMessageToolCallBlock from './ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlock.svelte';
 	import ChatMessageReasoningBlock from './ChatMessageReasoningBlock.svelte';
+	import { Bot, Brain } from '@lucide/svelte';
 	import {
 		ChatMessageActionCardContinueRequest,
 		ChatMessageActionCardPermissionRequest,
@@ -207,18 +208,45 @@
 
 <div class="agentic-content gap-2">
 	{#if message.agencyStep}
-		<div class="agency-step flex flex-wrap items-center gap-2 text-xs">
-			<span
-				class="rounded-full border border-border/60 bg-muted/40 px-2 py-0.5 font-medium text-muted-foreground"
-			>
-				{message.agencyStep.role === 'supervisor' ? '🧠' : '🤖'}
-				{message.agencyStep.label}
-			</span>
-			{#if message.agencyStep.subtask}
-				<span class="min-w-0 flex-1 truncate text-muted-foreground/80">
-					{message.agencyStep.subtask}
-				</span>
+		<div
+			class="agency-step flex min-w-0 items-start gap-2.5 border-l-2 border-primary/60 bg-muted/25 px-3 py-2.5"
+		>
+			{#if message.agencyStep.role === 'supervisor'}
+				<Brain class="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+			{:else}
+				<Bot class="mt-0.5 h-4 w-4 shrink-0 text-primary" />
 			{/if}
+			<div class="min-w-0 flex-1">
+				<div class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+					<span class="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">
+						{message.agencyStep.role === 'supervisor' ? 'Supervisor' : 'Agente'}
+					</span>
+					<span class="break-words text-xs font-semibold leading-snug text-foreground">
+						{message.agencyStep.label}
+					</span>
+					{#if isStreaming && isLastAssistantMessage}
+						<span
+							class="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-primary"
+							aria-label="En curso"
+						></span>
+					{/if}
+				</div>
+				{#if message.agencyStep.phases?.length}
+					<div class="mt-1.5 flex flex-wrap gap-1">
+						{#each message.agencyStep.phases as phase (phase)}
+							<span
+								class="rounded-sm bg-background/70 px-1.5 py-0.5 text-[9px] font-medium text-muted-foreground"
+								>{phase}</span
+							>
+						{/each}
+					</div>
+				{/if}
+				{#if message.agencyStep.subtask}
+					<p class="mt-1.5 break-words text-xs leading-relaxed text-muted-foreground">
+						{message.agencyStep.subtask}
+					</p>
+				{/if}
+			</div>
 		</div>
 	{/if}
 

@@ -1,11 +1,25 @@
 # tools/mcp_client.py
-"""Cliente MCP HTTP para el servidor de dev_agent (http://127.0.0.1:15000/mcp).
+"""EL cliente de herramientas del runtime (MCP HTTP, dev_agent :15000/mcp).
 
-El servidor FastMCP expone EXACTAMENTE dos herramientas — `query_tools` y
-`execute_tool` — y es el mismo punto que usa la Web UI. El agente (core/CLI)
-ejecuta TODAS sus herramientas a través de este cliente, en vez de importar
-dev_agent en proceso. Eso evita los problemas del mecanismo anterior:
-nombres duplicados query/execute, y consultas de descubrimiento vacías.
+El servidor FastMCP expone EXACTAMENTE dos herramientas — `query_tools`
+(descubrir) y `execute_tool` (ejecutar) — y es el mismo punto que usa la Web
+UI. Nada más ejecuta herramientas: el agente core, el CLI y los servicios
+pasan por aquí.
+
+Qué vive en este módulo (y por qué aquí y no en `agent_core`)
+------------------------------------------------------------
+1. El cliente JSON-RPC (`MCPClient`).
+2. El **enrutado de las meta-tools**: `execute_tool('execute_tool', {...})`
+   existe porque el modelo a veces anida la llamada; antes esta lógica estaba
+   duplicada en `agent_core`.
+3. La **whitelist por agente** (`tool_policy.ToolPolicy`): se comprueba ANTES
+   de ejecutar nada, así que una herramienta denegada no produce efectos
+   secundarios ni se puede saltar desde caminos alternativos.
+4. El **fallback en proceso**: si el servidor HTTP no está levantado, se ejecuta
+   contra `dev_agent` importado en este mismo proceso. La app es local: que
+   todas las herramientas fallen porque falta arrancar un segundo proceso no es
+   aceptable, y sin esto `mcp_available() == False` convertía cada tool call en
+   "Error: MCP no disponible".
 
 Protocolo: JSON-RPC 2.0 sobre HTTP (Streamable HTTP). El servidor asigna un
 `Mcp-Session-Id` en la respuesta de `initialize`; las llamadas siguientes lo
@@ -52,7 +66,15 @@ _STATIC_TOOLS: List[Dict[str, Any]] = [
                 "query": {
                     "type": "string",
                     "description": "La tarea o consulta en lenguaje natural.",
-                }
+                },
+                "allowed": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Whitelist del agente que pregunta: si se envía, solo se "
+                        "devuelven herramientas permitidas para él."
+                    ),
+                },
             },
             "required": ["query"],
         },
@@ -206,9 +228,16 @@ class MCPClient:
             return f"Error: {_extract_text(result)}"
         return _extract_text(result)
 
-    def query_tools(self, query: str) -> str:
-        """Descubrimiento semántico: devuelve las herramientas relevantes."""
-        return self.call_tool("query_tools", {"query": query or ""})
+    def query_tools(self, query: str, allowed: Optional[List[str]] = None) -> str:
+        """Descubrimiento semántico: devuelve las herramientas relevantes.
+
+        `allowed` viaja al servidor para que filtre el ranking por la whitelist
+        del agente que pregunta (así no le propone lo que no puede ejecutar).
+        """
+        payload: Dict[str, Any] = {"query": query or ""}
+        if allowed is not None:
+            payload["allowed"] = list(allowed)
+        return self.call_tool("query_tools", payload)
 
     def execute_tool(self, tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> str:
         """Ejecuta una herramienta interna por nombre vía el MCP."""
@@ -237,6 +266,12 @@ def _extract_text(result: Dict[str, Any]) -> str:
 _client: Optional[MCPClient] = None
 _client_lock = threading.Lock()
 
+#: Resultado negativo de `mcp_available()` cacheado unos segundos: si el
+#: servidor está caído, cada tool call hacía su propio intento HTTP (con su
+#: timeout) y el paso entero se iba en esperas.
+_UNAVAILABLE_TTL = 5.0
+_unavailable_since: Optional[float] = None
+
 
 def get_client() -> MCPClient:
     global _client
@@ -249,27 +284,105 @@ def get_client() -> MCPClient:
 
 def mcp_available() -> bool:
     """True si el endpoint MCP responde (best-effort, con caché)."""
+    global _unavailable_since
+    if _unavailable_since is not None:
+        import time as _time
+        if (_time.time() - _unavailable_since) < _UNAVAILABLE_TTL:
+            return False
     try:
         tools = get_client().list_tools(use_cache=True)
-        return bool(tools)
+        ok = bool(tools)
     except Exception:
-        return False
+        ok = False
+    if ok:
+        _unavailable_since = None
+    else:
+        import time as _time
+        _unavailable_since = _time.time()
+    return ok
 
 
-def query_tools(query: str) -> str:
-    """Versión de módulo de query_tools (descubrimiento de herramientas)."""
+def _policy_allowed(policy: Any) -> Optional[List[str]]:
+    """Whitelist que viaja al servidor: `None` = sin restricción."""
+    if policy is None or getattr(policy, "open_policy", False):
+        return None
+    allowed = getattr(policy, "allowed", None)
+    return sorted(allowed) if allowed is not None else None
+
+
+def _query_in_process(query: str, allowed: Optional[List[str]] = None) -> str:
+    """Descubrimiento sin servidor HTTP (dev_agent en este proceso)."""
     try:
-        return get_client().query_tools(query)
+        try:
+            from tools import dev_agent  # type: ignore
+        except ImportError:
+            import dev_agent  # type: ignore
+        return dev_agent.query_tools_global(query, allowed=allowed)
     except Exception as e:
-        return f"Error: MCP query_tools no disponible: {e}"
+        return f"Error: no se pudo consultar las herramientas: {e}"
 
 
-def execute_tool(tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> str:
-    """Versión de módulo de execute_tool (ejecución vía MCP)."""
+def _execute_in_process(tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> str:
+    """Ejecución sin servidor HTTP (dev_agent en este proceso)."""
     try:
-        return get_client().execute_tool(tool_name, arguments)
+        try:
+            from tools import dev_agent  # type: ignore
+        except ImportError:
+            import dev_agent  # type: ignore
+        return dev_agent.execute_tool_global(tool_name, arguments or {})
     except Exception as e:
-        return f"Error: MCP execute_tool no disponible: {e}"
+        return (
+            f"Error: la herramienta '{tool_name}' no está disponible "
+            f"(MCP caído y fallback en proceso falló: {e})"
+        )
+
+
+def query_tools(query: str, policy: Any = None) -> str:
+    """Descubrimiento de herramientas, filtrado por la whitelist del agente."""
+    allowed = _policy_allowed(policy)
+    try:
+        if mcp_available():
+            return get_client().query_tools(query, allowed=allowed)
+    except Exception as e:
+        logger.debug(f"query_tools por HTTP falló, usando fallback en proceso: {e}")
+    return _query_in_process(query, allowed=allowed)
+
+
+def execute_tool(tool_name: str, arguments: Optional[Dict[str, Any]] = None,
+                 policy: Any = None) -> str:
+    """Ejecuta una herramienta interna. ÚNICO punto de ejecución del runtime.
+
+    Orden de las comprobaciones:
+
+    1. Meta-tools anidadas (`query_tools`, `execute_tool`): se enrutan.
+    2. Whitelist del agente: si la herramienta no está permitida, NO se ejecuta
+       y se devuelve un mensaje determinista (`policy.denial`).
+    3. Servidor MCP; si no responde, `dev_agent` en este mismo proceso.
+    """
+    if not tool_name:
+        return "Error: execute_tool requiere tool_name."
+    args = arguments if isinstance(arguments, dict) else {}
+
+    if tool_name == "query_tools":
+        q = args.get("query") if "query" in args else str(args)
+        return query_tools(q, policy=policy)
+
+    if tool_name == "execute_tool":
+        inner = args.get("tool_name")
+        inner_args = args.get("arguments") if isinstance(args.get("arguments"), dict) else {}
+        if not inner:
+            return "Error: execute_tool requiere tool_name."
+        return execute_tool(inner, inner_args, policy=policy)
+
+    if policy is not None and not policy.allows(tool_name):
+        return policy.denial(tool_name)
+
+    try:
+        if mcp_available():
+            return get_client().execute_tool(tool_name, args)
+    except Exception as e:
+        logger.debug(f"execute_tool({tool_name}) por HTTP falló, fallback en proceso: {e}")
+    return _execute_in_process(tool_name, args)
 
 
 def list_tool_names() -> List[str]:

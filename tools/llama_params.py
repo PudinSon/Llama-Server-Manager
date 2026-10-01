@@ -28,6 +28,49 @@ except Exception:  # pragma: no cover - psutil es opcional en runtime
     _PSUTIL_AVAILABLE = False
 
 
+# ── Razonamiento ───────────────────────────────────────────────────────────
+#: Valores que acepta `--reasoning-format` de llama-server (una lista cerrada:
+#: un valor desconocido aborta el arranque del servidor). Orden = el del
+#: selector en las dos interfaces.
+#:
+#: - `none` — deja los "thoughts" sin parsear dentro de `message.content`.
+#: - `deepseek` — los mueve a `message.reasoning_content`, que es lo que lee
+#:   `agent_core.chat_stream` (el agente los muestra como razonamiento aparte).
+#: - `deepseek-legacy` — mantiene las etiquetas `<think>` en el contenido y
+#:   además rellena `message.reasoning_content`.
+#: - `auto` — decide la plantilla del modelo (valor por defecto del servidor).
+REASONING_FORMATS = ("none", "deepseek", "deepseek-legacy", "auto")
+#: Valor por defecto: `auto`, el mismo comportamiento que tenía no pasar el flag
+#: (y que, como el resto de defaults del servidor, no se inyecta).
+DEFAULT_REASONING_FORMAT = "auto"
+
+
+def migrate_reasoning_format(defaults: dict) -> None:
+    """Migra el antiguo checkbox `reasoning_format_enabled` al selector.
+
+    `reasoning_format_enabled=True` emitía `--reasoning-format deepseek`;
+    `False` —el valor por defecto— no emitía el flag, que equivale al `auto`
+    del servidor (que sigue sin inyectarse). La migración conserva el comportamiento anterior exacto y
+    normaliza el valor guardado: minúsculas, y a `auto` si no está en la lista
+    (llama-server no arranca con un formato desconocido).
+    """
+    if not isinstance(defaults, dict):
+        return
+
+    legacy = defaults.pop("reasoning_format_enabled", None)
+    current = defaults.get("reasoning_format")
+
+    if isinstance(current, str) and current.strip().lower() in REASONING_FORMATS:
+        defaults["reasoning_format"] = current.strip().lower()
+        return
+
+    if legacy is None:
+        defaults["reasoning_format"] = DEFAULT_REASONING_FORMAT
+        return
+
+    defaults["reasoning_format"] = "deepseek" if bool(legacy) else DEFAULT_REASONING_FORMAT
+
+
 # ── Rendimiento, DSpark y MoE ──────────────────────────────────────────────
 # Defaults conservadores: no alteran el comportamiento previo de llama.cpp.
 LLAMA_PERFORMANCE_DEFAULTS = {
@@ -41,6 +84,13 @@ LLAMA_PERFORMANCE_DEFAULTS = {
     "perf_enabled": False,       # --perf (diagnóstico)
     "no_kv_offload": False,      # -nkvo
     "load_mode": "auto",         # -lm: auto/mmap/mlock/mmap+mlock/dio
+    # Razonamiento (Configuraciones Avanzadas → Rendimiento, tras --perf).
+    # `reasoning_preserve` mantiene la traza de razonamiento en TODO el
+    # historial (no solo en el último mensaje del asistente); la plantilla debe
+    # declarar 'supports_preserve_reasoning' o llama.cpp lo ignora.
+    # `reasoning_format` es el valor que se pasa a `--reasoning-format`.
+    "reasoning_preserve": False,
+    "reasoning_format": DEFAULT_REASONING_FORMAT,
     # Context checkpoints: reutilización de prefijo KV en pasos sucesivos.
     # A diferencia de --cache-reuse, NO se ve afectado por multimodal
     # (--mmproj). Sin esto, cada paso de AGENCY reprocesa el prompt entero.
@@ -93,6 +143,13 @@ class LlamaCommandMixin:
                 return int(float(value))
             except Exception:
                 return default
+
+    def _safe_float(self, value, default=None):
+        """Convierte a float de forma tolerante (acepta '0.95', 1, None...)."""
+        try:
+            return float(value)
+        except Exception:
+            return default
 
     def _normalize_ngl(self, value, default="0"):
         """Normaliza capas GPU admitiendo int, 'auto', 'all' o números en texto."""
@@ -237,6 +294,23 @@ class LlamaCommandMixin:
 
         return cmd
 
+    def _inject_sampling_params(self, cmd):
+        """Añade el muestreo generalista que va tras `--repeat-penalty`.
+
+        `--top-k 40` y `--top-p 0.95` son los valores generalistas por defecto y
+        se emiten SIEMPRE (no condicionados a "distinto del default"): así el
+        comando real y lo que muestra la configuración coinciden. La puerta es
+        única para que el manager de escritorio y el panel web no puedan
+        divergir en el muestreo.
+        """
+        if not self._has_flag_exact(cmd, "--top-k"):
+            top_k = self._safe_int(self.defaults.get("top_k", 40), 40)
+            cmd.extend(["--top-k", str(top_k)])
+        if not self._has_flag_exact(cmd, "--top-p"):
+            top_p = self._safe_float(self.defaults.get("top_p", 0.95), 0.95)
+            cmd.extend(["--top-p", f"{top_p:g}"])
+        return cmd
+
     def _inject_performance_params(self, cmd):
         """Inyecta parámetros de rendimiento solo si difieren de los defaults de llama.cpp."""
         if not self._has_flag_exact(cmd, "-b", "--batch-size"):
@@ -265,6 +339,30 @@ class LlamaCommandMixin:
                 cmd.extend(["-to", str(timeout)])
         if self.defaults.get("perf_enabled", False) and not self._has_flag_exact(cmd, "--perf"):
             cmd.append("--perf")
+        # Razonamiento: va justo después de --perf, como en la configuración.
+        if (
+            self.defaults.get("reasoning_preserve", False)
+            and not self._has_flag_exact(cmd, "--reasoning-preserve", "--no-reasoning-preserve")
+            and self._flag_supported("--reasoning-preserve")
+        ):
+            cmd.append("--reasoning-preserve")
+        reasoning_format = str(
+            self.defaults.get("reasoning_format", DEFAULT_REASONING_FORMAT)
+            or DEFAULT_REASONING_FORMAT
+        ).strip().lower()
+        # Solo valores de la lista (llama-server aborta el arranque con
+        # "Unknown reasoning format" y aquí no hay terminal que lo explique) y
+        # nunca el valor por defecto del servidor: `auto` no se inyecta, igual
+        # que el resto de parámetros que coinciden con los defaults.
+        if (
+            reasoning_format in REASONING_FORMATS
+            and reasoning_format != DEFAULT_REASONING_FORMAT
+            and not self._has_flag_exact(cmd, "--reasoning-format")
+            and self._flag_supported("--reasoning-format")
+        ):
+            # `deepseek` deja los "thoughts" en `message.reasoning_content` en
+            # vez de mezclarlos en el contenido: es lo que lee `agent_core`.
+            cmd.extend(["--reasoning-format", reasoning_format])
         if self.defaults.get("no_kv_offload", False) and not self._has_flag_exact(cmd, "-nkvo", "--no-kv-offload"):
             cmd.append("-nkvo")
         load_mode = str(self.defaults.get("load_mode", "auto") or "auto").strip().lower()
@@ -281,7 +379,8 @@ class LlamaCommandMixin:
         include_speculation=True,
         include_moe=True,
     ):
-        """Aplica optimización, rendimiento, DSpark y MoE de forma segura."""
+        """Aplica muestreo, optimización, rendimiento, DSpark y MoE de forma segura."""
+        self._inject_sampling_params(cmd)
         self._add_optimization_params(cmd)
         if include_performance:
             self._inject_performance_params(cmd)

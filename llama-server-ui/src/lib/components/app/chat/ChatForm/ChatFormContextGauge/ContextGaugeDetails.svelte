@@ -14,11 +14,24 @@
 		cumulativeRead: number;
 		cumulativeOutput: number;
 		cumulativeCacheTotal: number;
+		/**
+		 * Consumo del modo agente. Se informa aquí, aparte del chat: los turnos
+		 * agenciales llevan el total acumulado del job y sumarlos al contexto
+		 * inflaba el contador.
+		 */
+		agentTokens: number;
+		agentPromptTokens: number;
+		agentOutputTokens: number;
+		agentCacheTotal: number;
 		averageTokensPerSecond: number | null;
 		transientDetails: string[];
 	}
 
 	let {
+		agentCacheTotal,
+		agentOutputTokens,
+		agentPromptTokens,
+		agentTokens,
 		averageTokensPerSecond,
 		cumulativeCacheTotal,
 		cumulativeOutput,
@@ -69,6 +82,24 @@
 							value={`${cumulativeOutput.toLocaleString()} tok`}
 						/>
 					{/if}
+				</div>
+			</div>
+		{/if}
+
+		{#if agentTokens > 0}
+			<div>
+				<h3 class="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70 mb-2">
+					Agent mode
+				</h3>
+
+				<div class="flex flex-col gap-2">
+					<ContextGaugeDetailRow
+						label="Agent tokens consumed"
+						value={`${agentTokens.toLocaleString()} tok`}
+						subtitle={`${agentPromptTokens.toLocaleString()} prompt + ${agentOutputTokens.toLocaleString()} generated${agentCacheTotal > 0
+							? ` · ${agentCacheTotal.toLocaleString()} from KV cache`
+							: ''} · not added to the chat context`}
+					/>
 				</div>
 			</div>
 		{/if}

@@ -30,9 +30,19 @@ except ImportError:
     import process_manager  # type: ignore
 
 try:
-    from tools.llama_params import LLAMA_PERFORMANCE_DEFAULTS, LlamaCommandMixin
+    from tools.llama_params import (
+        REASONING_FORMATS,
+        LLAMA_PERFORMANCE_DEFAULTS,
+        LlamaCommandMixin,
+        migrate_reasoning_format,
+    )
 except ImportError:  # ejecución directa: python tools/web_manager_server.py
-    from llama_params import LLAMA_PERFORMANCE_DEFAULTS, LlamaCommandMixin  # type: ignore
+    from llama_params import (  # type: ignore
+        REASONING_FORMATS,
+        LLAMA_PERFORMANCE_DEFAULTS,
+        LlamaCommandMixin,
+        migrate_reasoning_format,
+    )
 
 
 WEB_MANAGER_PORT = 12000
@@ -40,6 +50,15 @@ ROUTER_MODE_TOKEN = "__router__"
 # dev_agent escucha aquí; el panel le reenvía las llamadas añadiendo el token.
 AGENT_BASE_URL = "http://127.0.0.1:15000"
 AGENT_PROXY_TIMEOUT = 60.0
+
+
+def _automation_port() -> int:
+    """Puerto del servicio 24/7 (mismo criterio que el manager de escritorio)."""
+    try:
+        from tools.automation_process import port as automation_port
+        return int(automation_port())
+    except Exception:
+        return int(os.environ.get("AUTOMATION_PORT", "15001"))
 
 
 def _agent_token() -> str:
@@ -59,17 +78,24 @@ _INT_CONFIG_KEYS = (
     "chat_port", "embed_port", "c", "threads_chat", "threads_embed",
     "batch_size", "ubatch_size", "parallel", "poll", "threads_http",
     "timeout", "spec_draft_n_max", "spec_draft_n_min", "n_cpu_moe",
-    "ctx_checkpoints",
+    "ctx_checkpoints", "top_k",
 )
 _NGL_CONFIG_KEYS = ("n_gpu_layers", "n_gpu_layers_draft")
-_FLOAT_CONFIG_KEYS = ("temp", "repeat_penalty")
+_FLOAT_CONFIG_KEYS = ("temp", "repeat_penalty", "top_p")
 _OPTIONAL_INT_CONFIG_KEYS = ("spec_draft_threads", "spec_draft_threads_batch")
 _BOOL_CONFIG_KEYS = (
-    "perf_enabled", "no_kv_offload", "dspark_enabled", "gpu_for_dspark",
+    "perf_enabled", "no_kv_offload", "reasoning_preserve",
+    "dspark_enabled", "gpu_for_dspark",
     "moe_enabled", "gpu_for_moe", "cpu_moe", "webui_mcp_proxy",
     "gpu_for_embeddings", "gpu_for_chat", "use_agent", "no_ui", "piper_enabled",
-    "laya_enabled", "laya_preload", "enable_multimodal",
+    "laya_enabled", "laya_preload", "enable_multimodal", "automation_enabled",
 )
+# Claves de configuración que solo admiten una lista cerrada de valores: el
+# valor recibido se valida antes de guardarse (llama-server aborta el arranque
+# con un valor desconocido, p. ej. `--reasoning-format`).
+_CHOICE_CONFIG_KEYS: dict[str, tuple[str, ...]] = {
+    "reasoning_format": tuple(REASONING_FORMATS),
+}
 
 
 class WebManagerState(LlamaCommandMixin):
@@ -91,6 +117,9 @@ class WebManagerState(LlamaCommandMixin):
             "n_gpu_layers": 24,
             "temp": 0.5,
             "repeat_penalty": 1.05,
+            # Muestreo generalista (mismos defaults que el manager de escritorio).
+            "top_p": 0.95,
+            "top_k": 40,
             "webui_mcp_proxy": True,
             "embed_chunk_size": 512,
             "embed_max_fragments": 3,
@@ -110,6 +139,9 @@ class WebManagerState(LlamaCommandMixin):
             "use_agent": False,
             "no_ui": False,
             "piper_enabled": True,
+            # Automatización 24/7: la arranca el manager (proceso hijo) y la para
+            # con él; cerrar la web view no la detiene.
+            "automation_enabled": True,
             "laya_enabled": True,
             "laya_preload": False,
             "interface_preference": "WebUI",
@@ -133,6 +165,9 @@ class WebManagerState(LlamaCommandMixin):
             self.model_dir = data.get("model_dir", self.model_dir)
             self.embed_dir = data.get("embed_dir", self.embed_dir)
             self.defaults.update(data.get("defaults", {}))
+            # El antiguo checkbox `reasoning_format_enabled` es ahora el
+            # selector `reasoning_format`.
+            migrate_reasoning_format(self.defaults)
         except FileNotFoundError:
             pass
         except Exception as error:
@@ -201,7 +236,7 @@ class WebManagerState(LlamaCommandMixin):
         if process and process.poll() is None:
             return True
         ports = {"chat": 8081, "embeddings": 8082, "dev_agent": 15000, "rag": 25000,
-                 "piper": 8880, "workspace": 19000}
+                 "piper": 8880, "workspace": 19000, "automation": _automation_port()}
         port = ports.get(name)
         return bool(port and process_manager.is_port_in_use(port))
 
@@ -213,6 +248,7 @@ class WebManagerState(LlamaCommandMixin):
             "rag": {"running": self._running("rag"), "port": 25000},
             "piper": {"running": self._running("piper"), "port": 8880},
             "workspace": {"running": self._running("workspace"), "port": 19000},
+            "automation": {"running": self._running("automation"), "port": _automation_port()},
             "models": {
                 "available": self.models,
                 "labels": self.model_labels,
@@ -354,6 +390,20 @@ class WebManagerState(LlamaCommandMixin):
             os.environ["PIPER_MODEL_DIR"] = str(Path(self.data_dir) / "piper" / "voices")
             os.environ["LLAMA_MANAGER_DATA_DIR"] = str(self.data_dir)
             return self._start_process(name, command, str(runtime.get_base_dir()))
+        if name == "automation":
+            # Servicio 24/7 (dispatchers, cola y webhooks): proceso propio, pero
+            # hijo de quien lo arranca (aquí, este panel/manager).
+            from tools.automation_process import start as start_automation
+            result = start_automation(
+                port_number=_automation_port(),
+                workspace=self.defaults.get("workspace_path"),
+                parent_pid=os.getpid(),
+            )
+            if result.get("success"):
+                self.log(f"🤖 Automatización 24/7 {result.get('status')} (puerto {result.get('port')})")
+            else:
+                self.log(f"❌ Automatización 24/7: {result.get('error')}", "ERROR")
+            return result
         return {"success": False, "error": f"Servicio no soportado: {name}"}
 
     def stop(self, name: str) -> None:
@@ -366,8 +416,13 @@ class WebManagerState(LlamaCommandMixin):
             self.processes.pop(name, None)
             self.log(f"⏹ {name} detenido")
             return
+        if name == "automation":
+            from tools.automation_process import stop as stop_automation
+            stop_automation(port_number=_automation_port())
+            self.log("⏹ automation detenido")
+            return
         ports = {"chat": 8081, "embeddings": 8082, "dev_agent": 15000, "rag": 25000,
-                 "piper": 8880, "workspace": 19000}
+                 "piper": 8880, "workspace": 19000, "automation": _automation_port()}
         port = ports.get(name)
         if port and process_manager.is_port_in_use(port):
             process_manager.stop_server(port=port, wait=2.0)
@@ -667,7 +722,7 @@ function buildShell() {
         '<button class="small" data-action="laya-load">Cargar</button> ' +
         '<button class="stop small" data-action="laya-unload">Descargar</button>' +
         '</span></div>' +
-        '<div class="muted">~650 MB en RAM. Si el modelo no está, el orquestador usa el router de Gemma.</div>' +
+        '<div class="muted">~650 MB en RAM. Si el modelo no está, el orquestador usa las heurísticas léxicas.</div>' +
       '</div>' +
       '<div class="card">' +
         '<h2>📁 Workspace</h2>' +
@@ -685,13 +740,21 @@ function buildShell() {
     '</div>';
 }
 
+var SERVICE_LABELS = {
+  embeddings: 'embeddings',
+  dev_agent: 'agente MCP',
+  rag: 'RAG',
+  piper: 'voz Piper',
+  automation: 'automatización 24/7'
+};
+
 function serviceCards(list) {
   return list.map(function (n) {
     var s = statusData ? statusData[n] : null;
     var on = !!(s && s.running);
     var cls = on ? 'on' : 'off';
     var st = on ? 'activo' : 'detenido';
-    return '<div class="row"><span class="svc"><span class="badge ' + cls + '"><span class="dot"></span>' + n + ' · ' + st + '</span></span>' +
+    return '<div class="row"><span class="svc"><span class="badge ' + cls + '"><span class="dot"></span>' + esc(SERVICE_LABELS[n] || n) + ' · ' + st + '</span></span>' +
       '<span>' +
       '<button class="small" data-action="start-service" data-service="' + n + '">Iniciar</button> ' +
       '<button class="stop small" data-action="stop-service" data-service="' + n + '">Detener</button>' +
@@ -749,7 +812,7 @@ function refreshStatus() {
     var portEl = d.getElementById('chat-port');
     if (portEl) { portEl.textContent = 'puerto ' + s.chat.port; }
     var svcEl = d.getElementById('services');
-    if (svcEl) { svcEl.innerHTML = serviceCards(['embeddings', 'dev_agent', 'rag', 'piper']); }
+    if (svcEl) { svcEl.innerHTML = serviceCards(['embeddings', 'dev_agent', 'rag', 'piper', 'automation']); }
     refreshLaya();
     var ml = d.getElementById('model-list');
     if (ml) { selectPreserve(ml, s.models.available || [], null, s.models.labels || {}); }
@@ -832,14 +895,17 @@ var PERF_HELP_TIPS = {
   n_gpu_layers: "Capas del modelo que se cargan en GPU (-ngl). 'auto' decide según tu VRAM; 'all' sube todo; un número menor deja el resto en CPU.",
   temp: "Temperatura de muestreo: baja (0.1-0.4) = respuestas más deterministas; alta (>0.8) = más creativas e impredecibles.",
   repeat_penalty: "Penalización de repetición (1 = desactivada). 1.05-1.15 evita bucles sin coartar mucho el estilo; valores altos degradan la coherencia.",
+  top_p: "Top-p (nucleus sampling, --top-p): 0.95 = generalista; recorta la cola de tokens improbables sin perder variedad. 1.0 = desactivado. Evita combinarlo con un --top-k muy agresivo.",
+  top_k: "Top-k (--top-k): limita el muestreo a las N palabras más probables. 40 = generalista; 0 = desactivado (sin filtro, más diverso y más impredecible).",
   webui_mcp_proxy: "Expone el proxy MCP en la WebUI para que el agente use sus herramientas desde el navegador.",
   gpu_for_embeddings: "Carga el modelo de embeddings en GPU (por defecto ON): acelera el RAG a cambio de VRAM.",
   gpu_for_chat: "Carga el modelo de chat en GPU (por defecto OFF): mucha más velocidad si tienes VRAM suficiente para el modelo y su contexto.",
   use_agent: "Activa --agent en llama-server: herramientas integradas (archivos, código…) usables por AGENCY/PLAN.",
   no_ui: "Oculta el visor embebido (--no-ui): útil en servidores headless o si solo usas el panel web.",
   piper_enabled: "Servicio de voz Piper (TTS local). Consume ~200 MB de RAM; desactívalo si no usas salida de audio.",
+  automation_enabled: "Servicio de automatización 24/7 (puerto 15001): cola persistente, dispatchers (webhooks, cron, filewatch, IMAP), aprobaciones y auditoría. El manager lo arranca al iniciar y lo detiene al cerrarse — sin manager no hay modelo y los dispatchers no tendrían nada que ejecutar. Corre en su propio proceso, así que cerrar la web view no lo detiene; si el manager muere de golpe, el watchdog del servicio lo cierra.",
   enable_multimodal: "Carga el proyector visual (mmproj) para procesar imágenes. Nota: desactiva --cache-reuse y ralentiza cada paso en CPU; desactívalo para tareas solo de texto.",
-  laya_enabled: "Sustituye la llamada LLM del ToolRouter por un clasificador ONNX (~650 MB RAM, ~100× más rápido). Sin modelo, el orquestador usa Gemma.",
+  laya_enabled: "Clasificador ONNX local (~650 MB RAM, ~100× más rápido que una llamada LLM) que decide modo, naturaleza y dominio de cada tarea. Sin modelo, el orquestador usa las heurísticas léxicas.",
   laya_preload: "Carga Laya en memoria al arrancar el manager; si no, se carga en la primera ruta (primer uso algo más lento).",
   // ── Rendimiento ──
   batch_size: "Lógico de tokens procesados por pasada (-b). Más alto = más rapidez y más RAM. Recomendado: múltiplo del ubatch; en CPU, 512-2048 suele bastar.",
@@ -850,6 +916,8 @@ var PERF_HELP_TIPS = {
   threads_http: "Hilos del servidor HTTP integrado. Súbelo solo con muchas peticiones concurrentes; con 1-2 clientes no aporta nada.",
   timeout: "Tiempo máximo de espera por petición en segundos (-to). Con modelos lentos o contextos enormes, súbelo para evitar cortes prematuros.",
   perf_enabled: "Activa --perf: el servidor registra tiempos por fase (prompt eval, generación…) para diagnosticar cuellos de botella. Impacto mínimo en rendimiento.",
+  reasoning_preserve: "Preserva la traza de razonamiento en TODO el historial (--reasoning-preserve), no solo en el último mensaje del asistente. Necesita una plantilla con soporte de preserve reasoning; si no lo tiene, llama.cpp lo ignora.",
+  reasoning_format: "Formato del razonamiento (--reasoning-format). none: deja los 'thoughts' dentro del contenido. deepseek: los extrae a message.reasoning_content (el formato que consume el agente). deepseek-legacy: mantiene las etiquetas <think> en el contenido y además rellena reasoning_content. auto: lo decide la plantilla del modelo y es el valor por defecto de llama-server, así que no se añade el flag. Solo se aplica si tu llama-server reconoce el flag.",
   load_mode: "Modo de carga del modelo (-lm). mmap: mapea el archivo (arranque rápido, RAM bajo demanda). mlock: fija el modelo en RAM (estable, necesita memoria libre). dio: E/S directa (menos caché de disco).",
   no_kv_offload: "Mantiene la caché KV en CPU (-nkvo) aunque haya GPU: libera VRAM del modelo a cambio de generación algo más lenta.",
   dspark_enabled: "Decodificación especulativa: el modelo draft (DSpark) propone tokens y el principal los verifica en bloque. Más tokens/segundo si el draft acierta.",
@@ -872,12 +940,14 @@ var CFG_FIELDS = [
   ['Host', 'host'], ['Chat port', 'chat_port'], ['Embed port', 'embed_port'],
   ['Contexto (-c)', 'c'], ['Threads Chat', 'threads_chat'], ['Threads Embeds', 'threads_embed'],
   ['n_gpu_layers (auto/all/N)', 'n_gpu_layers'], ['Temp', 'temp'], ['Repeat penalty', 'repeat_penalty'],
+  ['Top-p', 'top_p'], ['Top-k', 'top_k'],
   // Rendimiento
   ['Batch size (-b)', 'batch_size'], ['Ubatch size (-ub)', 'ubatch_size'],
   ['Parallel slots (-np)', 'parallel'], ['Context checkpoints (0=off, 32=recomendado)', 'ctx_checkpoints'],
   ['Poll (--poll)', 'poll'],
   ['Threads HTTP', 'threads_http'], ['Timeout (-to)', 'timeout'],
   ['Load mode (-lm: auto/mmap/mlock/mmap+mlock/dio)', 'load_mode'],
+  ['--reasoning-format', 'reasoning_format', ['none', 'deepseek', 'deepseek-legacy', 'auto']],
   // DSpark
   ['Capas GPU draft (-ngld: auto/all/N)', 'n_gpu_layers_draft'],
   ['Máx. tokens draft (--spec-draft-n-max)', 'spec_draft_n_max'],
@@ -895,12 +965,15 @@ var CFG_CHECKS = [
   ['use_agent', 'Activar --agent (herramientas integradas)'],
   ['no_ui', 'Activar --no-ui (ocultar visor embebido)'],
   ['piper_enabled', 'Activar servicio Piper'],
+  ['automation_enabled', 'Activar servicio de automatización 24/7'],
   ['dspark_enabled', 'Activar DSpark si está disponible'],
   ['gpu_for_dspark', 'GPU para DSpark'],
   ['moe_enabled', 'Activar configuración MoE'],
   ['gpu_for_moe', 'GPU para expertos MoE'],
   ['cpu_moe', 'Todos los expertos en CPU (-cmoe)'],
   ['perf_enabled', '--perf (diagnóstico de rendimiento)'],
+  ['reasoning_preserve', '--reasoning-preserve'],
+
   ['no_kv_offload', '--no-kv-offload (-nkvo)'],
   ['laya_enabled', 'Router Laya ONNX (~650 MB, ~100× más rápido)'],
   ['laya_preload', 'Precargar Laya al arranque'],
@@ -917,7 +990,24 @@ function openConfig() {
       return PERF_HELP_TIPS[key] ? '<span class="help-dot" title="' + esc(PERF_HELP_TIPS[key]) + '">?</span>' : '';
     }
     document.getElementById('adv-grid').innerHTML = CFG_FIELDS.map(function (f) {
-      return '<div class="adv-row"><label' + tipAttr(f[1]) + '>' + f[0] + tipDot(f[1]) + '</label><input type="text" id="cfg-' + f[1] + '" value="' + esc(cfg[f[1]]) + '"></div>';
+      // f[2] opcional = lista cerrada de valores: se pinta un selector.
+      var opts = f[2];
+      var current = cfg[f[1]] == null ? '' : String(cfg[f[1]]);
+      var field;
+      if (opts) {
+        var inner = opts.map(function (o) {
+          return '<option value="' + esc(o) + '"' + (String(o) === current ? ' selected' : '') + '>' + esc(o) + '</option>';
+        }).join('');
+        // Un valor guardado fuera de la lista (config antigua) se muestra tal
+        // cual para que el usuario vea qué hay guardado antes de cambiarlo.
+        if (current !== '' && opts.indexOf(current) === -1) {
+          inner = '<option value="' + esc(current) + '" selected>' + esc(current) + '</option>' + inner;
+        }
+        field = '<select id="cfg-' + f[1] + '">' + inner + '</select>';
+      } else {
+        field = '<input type="text" id="cfg-' + f[1] + '" value="' + esc(current) + '">';
+      }
+      return '<div class="adv-row"><label' + tipAttr(f[1]) + '>' + f[0] + tipDot(f[1]) + '</label>' + field + '</div>';
     }).join('');
     document.getElementById('adv-checks').innerHTML = CFG_CHECKS.map(function (c) {
       var checked = !!cfg[c[0]];
@@ -1145,6 +1235,14 @@ def create_app(state: Optional[WebManagerState] = None) -> Flask:
                 else:
                     state.defaults[key] = bool(value)
                 continue
+            if key in _CHOICE_CONFIG_KEYS:
+                allowed = _CHOICE_CONFIG_KEYS[key]
+                text = str(value or "").strip().lower()
+                if text in allowed:
+                    state.defaults[key] = text
+                else:
+                    state.log(f"⚠️ Valor inválido para {key}: {value!r} (uno de: {', '.join(allowed)})", "ERROR")
+                continue
             if isinstance(value, str) and value.strip().lower() in ("true", "false"):
                 state.defaults[key] = value.strip().lower() == "true"
             else:
@@ -1219,8 +1317,36 @@ def create_app(state: Optional[WebManagerState] = None) -> Flask:
     return app
 
 
-def start_web_server(host: str = "0.0.0.0", port: int = WEB_MANAGER_PORT, state: Optional[WebManagerState] = None) -> None:
-    create_app(state).run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+def ensure_automation_service(state: WebManagerState) -> None:
+    """Arranca el servicio 24/7 si la configuración lo tiene activo.
+
+    Solo lo usa el panel cuando actúa como manager (modo `--web-only` o entorno
+    sin GUI): con la GUI, el dueño del servicio es el manager de escritorio y
+    arrancarlo aquí por duplicado haría competir dos procesos por el puerto.
+    """
+    try:
+        if not state.defaults.get("automation_enabled", True):
+            state.log("⏭️ Automatización 24/7 desactivada en la configuración.")
+            return
+        state.start_service("automation")
+    except Exception as error:
+        print(f"⚠️ Automatización 24/7 no disponible: {error}")
+
+
+def start_web_server(
+    host: str = "0.0.0.0",
+    port: int = WEB_MANAGER_PORT,
+    state: Optional[WebManagerState] = None,
+    ensure_automation: bool = False,
+) -> None:
+    # El estado se crea aquí para que el arranque del servicio 24/7 use el MISMO
+    # que la app (si no, `create_app` haría otro y escanearía los modelos dos veces).
+    state = state or WebManagerState()
+    app = create_app(state)
+    if ensure_automation:
+        # En hilo aparte: el dispatcher puede tardar y no debe retrasar el panel.
+        threading.Thread(target=ensure_automation_service, args=(state,), daemon=True).start()
+    app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
 
 
 if __name__ == "__main__":

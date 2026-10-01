@@ -4,10 +4,18 @@
  * Combines token usage persisted in message timings metadata with
  * server-originating data: model context size from /props (modelsStore)
  * and live processing state while streaming (chatStore).
+ *
+ * El modo agente se contabiliza APARTE. Los turnos de una ejecución agencial
+ * (`agencyStep`) llevan el total ACUMULADO del job, no el del turno, así que
+ * sumarlos al chat nativo multiplicaba el consumo y el gauge marcaba un
+ * contexto inexistente. Aquí quedan fuera de `read/cacheTotal/output` y de
+ * `lastTimings`, y se agregan en `agentRead/agentCacheTotal/agentOutput` para
+ * mostrarlos como consumo propio del modo agente.
  */
 
 import { MessageRole } from '$lib/enums';
 // direct imports between stores, not via the barrel, to avoid circular deps
+import { agentStore } from '$lib/stores/agentStore.svelte';
 import { agenticStore } from '$lib/stores/agentic/index.svelte';
 import { chatStore } from '$lib/stores/chat/index.svelte';
 import { conversationsStore } from '$lib/stores/conversations/index.svelte';
@@ -34,6 +42,12 @@ interface AssistantTimingsSummary {
 	output: number;
 	outputMs: number;
 	read: number;
+	/** Tokens de prompt del modo agente (suma de los deltas por job). */
+	agentRead: number;
+	/** Tokens reutilizados de la KV cache en el modo agente. */
+	agentCacheTotal: number;
+	/** Tokens generados por el modo agente (suma de los deltas por job). */
+	agentOutput: number;
 }
 
 /**
@@ -42,18 +56,57 @@ interface AssistantTimingsSummary {
  * agentic llm totals (cumulative gauge) and the cumulative sums. During
  * streaming activeMessages churns every chunk, and each of these used to be
  * its own O(n) scan re-run per chunk.
+ *
+ * Los turnos del modo agente (`agencyStep`) se agregan por separado: dentro de
+ * un job cada mensaje lleva el total acumulado del job, así que el consumo real
+ * es la suma de los incrementos, no la de los totales.
  */
-function summarizeAssistantTimings(messages: DatabaseMessage[]): AssistantTimingsSummary {
+export function summarizeAssistantTimings(messages: DatabaseMessage[]): AssistantTimingsSummary {
 	let lastAgenticLlm: ChatMessageAgenticTimings['llm'] | undefined;
 	let lastTimings: ChatMessageTimings | undefined;
 	let read = 0;
 	let cacheTotal = 0;
 	let output = 0;
 	let outputMs = 0;
+	let agentRead = 0;
+	let agentCacheTotal = 0;
+	let agentOutput = 0;
+	// Último turno agencial visto y si el turno anterior del hilo fue agencial:
+	// juntos marcan dónde los totales acumulados de un job empiezan de cero.
+	let previousAgentTurn: { cache: number; output: number; prompt: number } | null = null;
+	let previousTurnWasAgent = false;
 
 	for (const m of messages) {
 		if (m.role !== MessageRole.ASSISTANT || !m.timings) continue;
 
+		if (m.agencyStep) {
+			const prompt = m.timings.prompt_n ?? 0;
+			const cache = m.timings.cache_n ?? 0;
+			const generated = m.timings.predicted_n ?? 0;
+			// Un turno agencial después de uno nativo abre un job nuevo, y sus
+			// totales vuelven a empezar: sin base previa se suma el total entero.
+			const baseline = previousTurnWasAgent ? previousAgentTurn : null;
+
+			// Dentro de un job los totales solo crecen, así que lo consumido es
+			// la diferencia con el turno anterior. Una bajada delata otro job,
+			// que arranca su propia cuenta desde cero.
+			if (baseline === null || prompt < baseline.prompt || generated < baseline.output) {
+				agentRead += prompt;
+				agentCacheTotal += cache;
+				agentOutput += generated;
+			} else {
+				agentRead += prompt - baseline.prompt;
+				agentCacheTotal += cache - baseline.cache;
+				agentOutput += generated - baseline.output;
+			}
+
+			previousAgentTurn = { cache, output: generated, prompt };
+			previousTurnWasAgent = true;
+
+			continue;
+		}
+
+		previousTurnWasAgent = false;
 		lastTimings = m.timings;
 
 		if (m.timings.agentic?.llm?.predicted_n != null) {
@@ -66,7 +119,17 @@ function summarizeAssistantTimings(messages: DatabaseMessage[]): AssistantTiming
 		outputMs += m.timings.predicted_ms ?? 0;
 	}
 
-	return { cacheTotal, lastAgenticLlm, lastTimings, output, outputMs, read };
+	return {
+		agentCacheTotal,
+		agentOutput,
+		agentRead,
+		cacheTotal,
+		lastAgenticLlm,
+		lastTimings,
+		output,
+		outputMs,
+		read
+	};
 }
 
 function deriveLiveStats(state: ApiProcessingState | null): LiveStats | null {
@@ -146,7 +209,21 @@ class ContextStatsStore {
 		return this.activeModelId ? modelsStore.props.getModelContextSize(this.activeModelId) : null;
 	});
 
-	private liveStats = $derived(deriveLiveStats(chatStore.processing.activeState));
+	/**
+	 * ¿El servidor está generando para un job agencial de ESTA conversación?
+	 * `chatStore.consumeAgencyJob` alimenta el mismo estado de procesamiento que
+	 * el chat, así que sin esta marca el consumo en vivo del agente entraría en
+	 * el contador del chat igual que el consumo ya persistido.
+	 */
+	private agencyRunActive = $derived.by(() => {
+		const convId = conversationsStore.activeConversation?.id ?? null;
+
+		return convId !== null && agentStore.isExecuting && agentStore.agencyConversationId === convId;
+	});
+
+	private liveStats = $derived(
+		this.agencyRunActive ? null : deriveLiveStats(chatStore.processing.activeState)
+	);
 
 	currentOutput = $derived.by(() => {
 		if (this.liveStats && this.liveStats.outputTokens > 0) return this.liveStats.outputTokens;
@@ -205,6 +282,18 @@ class ContextStatsStore {
 
 		return Math.max(fresh, this.liveStats?.freshTokens ?? 0);
 	});
+
+	/** Tokens de prompt del modo agente (fuera del contexto del chat). */
+	agentPromptTokens = $derived(this.assistantTimings.agentRead);
+
+	/** Tokens reutilizados de la KV cache durante el modo agente. */
+	agentCacheTotal = $derived(this.assistantTimings.agentCacheTotal);
+
+	/** Tokens generados por el modo agente (fuera del contexto del chat). */
+	agentOutputTokens = $derived(this.assistantTimings.agentOutput);
+
+	/** Consumo total del modo agente, el que el gauge NO cuenta como contexto. */
+	agentTokens = $derived(this.agentPromptTokens + this.agentOutputTokens);
 
 	isActiveModelLoaded = $derived(
 		this.activeModelId !== null &&

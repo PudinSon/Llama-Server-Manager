@@ -1,8 +1,8 @@
 """
 tools/laya_downloader.py
 
-Descarga y verificación del router Laya (ONNX) que puede sustituir al
-`ToolRouter` basado en Gemma.
+Descarga y verificación del router Laya (ONNX), el clasificador de tareas del
+sistema (modo, naturaleza y, cuando el modelo lo declare, dominio).
 
 IMPORTANTE — no se descarga nada automáticamente. Este módulo es pasivo: solo
 toca el disco cuando se invoca de forma explícita, ya sea por CLI
@@ -11,8 +11,9 @@ toca el disco cuando se invoca de forma explícita, ya sea por CLI
     python -m tools.laya_downloader --check    # solo informa del estado
 
 o por el endpoint `POST /api/laya/download` cuando el usuario lo pide desde el
-panel. El sistema completo funciona SIN el modelo: el orquestador cae al
-`ToolRouter` de Gemma, así que la descarga es siempre una decisión del usuario.
+panel. El sistema completo funciona SIN el modelo: `task_router.decide` cae a
+las heurísticas léxicas, así que la descarga es siempre una decisión del
+usuario.
 
 Estructura esperada en disco (`app_data/laya/`):
 

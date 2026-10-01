@@ -1,9 +1,14 @@
 /**
  * Cliente de la API del **servicio de automatización** (`tools/automation_service.py`).
  *
- * Este proceso es independiente del manager y del agente HTTP: corre siempre en
- * el puerto 15001 y es el que ejecuta los dispatchers, la cola y las
- * aprobaciones. La UI solo consulta y configura; no ejecuta nada.
+ * El servicio escucha en el puerto 15001 y es el que ejecuta los dispatchers, la
+ * cola y las aprobaciones. La UI solo consulta y configura; no ejecuta nada.
+ *
+ * El proceso lo arranca el **Manager** (`tools/automation_process.py`) y muere
+ * con él: sin manager no hay modelo cargado y los dispatchers no tendrían nada
+ * que ejecutar. Corre aparte de la web view, así que cerrar la UI no lo detiene;
+ * si aquí no responde, el Manager no está corriendo o el servicio está
+ * desactivado en su configuración avanzada.
  *
  * La resolución de la URL la hace `serviceUrl('automation', ...)`, así que
  * funciona igual en modo directo (otro puerto del mismo host) que detrás de un
@@ -84,9 +89,71 @@ export interface AutomationImapStatus {
 	enabled?: boolean;
 	connected?: boolean;
 	folder?: string;
-	last_poll?: number | null;
+	last_poll?: { at?: number; found?: number; enqueued?: number } | null;
 	last_error?: string | null;
 	[key: string]: unknown;
+}
+
+export interface AutomationImapConfig {
+	enabled: boolean;
+	host: string;
+	port: number;
+	user: string;
+	has_password: boolean;
+	use_ssl: boolean;
+	folder: string;
+	search: string;
+	poll_interval: number;
+	mark_seen: boolean;
+	max_per_poll: number;
+	wake_prompt: string;
+	agent_template: string;
+	configured: boolean;
+	running: boolean;
+}
+
+export interface AutomationImapConfigInput {
+	enabled: boolean;
+	host: string;
+	port: number;
+	user: string;
+	password?: string;
+	use_ssl: boolean;
+	folder: string;
+	search: string;
+	poll_interval: number;
+	mark_seen: boolean;
+	max_per_poll: number;
+	wake_prompt: string;
+	agent_template: string;
+}
+
+export interface AutomationGmailConfig {
+	enabled: boolean;
+	connected: boolean;
+	address: string;
+	client_id: string;
+	has_client_secret: boolean;
+	redirect_uri: string;
+	search: string;
+	poll_interval: number;
+	mark_seen: boolean;
+	max_per_poll: number;
+	wake_prompt: string;
+	agent_template: string;
+	running?: boolean;
+	last_error?: string;
+	last_poll?: { at?: number; found?: number; enqueued?: number } | null;
+}
+
+export interface AutomationGmailConfigInput {
+	enabled: boolean;
+	search: string;
+	poll_interval: number;
+	mark_seen: boolean;
+	max_per_poll: number;
+	wake_prompt: string;
+	agent_template: string;
 }
 
 export interface AutomationWebhook {
@@ -115,6 +182,7 @@ export interface AutomationWebhooksStatus {
 export interface AutomationStatus {
 	dispatcher: AutomationDispatcherStatus;
 	imap: AutomationImapStatus;
+	gmail: AutomationGmailConfig;
 	webhooks?: AutomationWebhooksStatus;
 }
 
@@ -142,13 +210,78 @@ export function getAutomationStatus(): Promise<AutomationStatus> {
 	return apiJson<AutomationStatus>('automation', '/automation/status');
 }
 
+export function getAutomationImapConfig(): Promise<{ config: AutomationImapConfig }> {
+	return apiJson<{ config: AutomationImapConfig }>('automation', '/automation/imap/config');
+}
+
+export function saveAutomationImapConfig(
+	input: AutomationImapConfigInput
+): Promise<{ config: AutomationImapConfig }> {
+	return apiJson<{ config: AutomationImapConfig }>('automation', '/automation/imap/config', {
+		method: 'PUT',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(input)
+	});
+}
+
+export function testAutomationImapConnection(): Promise<{
+	success: boolean;
+	folder?: string;
+	error?: string;
+}> {
+	return apiJson('automation', '/automation/imap/test', { method: 'POST' });
+}
+
+export function getAutomationGmailConfig(): Promise<{ config: AutomationGmailConfig }> {
+	return apiJson<{ config: AutomationGmailConfig }>('automation', '/automation/gmail/config');
+}
+
+export function saveAutomationGmailConfig(
+	input: AutomationGmailConfigInput
+): Promise<{ config: AutomationGmailConfig }> {
+	return apiJson<{ config: AutomationGmailConfig }>('automation', '/automation/gmail/config', {
+		method: 'PUT',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(input)
+	});
+}
+
+export function beginGoogleMailLink(input: {
+	client_id: string;
+	client_secret?: string;
+}): Promise<{ authorization_url: string; redirect_uri: string }> {
+	return apiJson<{ authorization_url: string; redirect_uri: string }>(
+		'automation',
+		'/automation/gmail/oauth/start',
+		{
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(input)
+		}
+	);
+}
+
+export function disconnectGoogleMail(): Promise<{ config: AutomationGmailConfig }> {
+	return apiJson<{ config: AutomationGmailConfig }>('automation', '/automation/gmail/disconnect', {
+		method: 'POST'
+	});
+}
+
+export function pollAutomationGmail(): Promise<{ found: number; enqueued: number }> {
+	return apiJson<{ found: number; enqueued: number }>('automation', '/automation/gmail/poll', {
+		method: 'POST'
+	});
+}
+
 /** Tareas de la cola (filtros opcionales). */
-export async function listAutomationTasks(options: {
-	status?: string;
-	source?: string;
-	limit?: number;
-	offset?: number;
-} = {}): Promise<{ tasks: AutomationTask[]; stats: AutomationQueueStats }> {
+export async function listAutomationTasks(
+	options: {
+		status?: string;
+		source?: string;
+		limit?: number;
+		offset?: number;
+	} = {}
+): Promise<{ tasks: AutomationTask[]; stats: AutomationQueueStats }> {
 	const params = new URLSearchParams();
 	if (options.status) params.set('status', options.status);
 	if (options.source) params.set('source', options.source);
@@ -199,17 +332,25 @@ export function retryAutomationTask(
 }
 
 export function approveAutomationTask(token: string): Promise<{ task_id: number }> {
-	return apiJson<{ task_id: number }>('automation', `/automation/approve/${encodeURIComponent(token)}`, {
-		method: 'POST'
-	});
+	return apiJson<{ task_id: number }>(
+		'automation',
+		`/automation/approve/${encodeURIComponent(token)}`,
+		{
+			method: 'POST'
+		}
+	);
 }
 
 export function rejectAutomationTask(token: string, reason = ''): Promise<{ task_id: number }> {
-	return apiJson<{ task_id: number }>('automation', `/automation/reject/${encodeURIComponent(token)}`, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ reason })
-	});
+	return apiJson<{ task_id: number }>(
+		'automation',
+		`/automation/reject/${encodeURIComponent(token)}`,
+		{
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ reason })
+		}
+	);
 }
 
 /** Historial de auditoría (encolar, aprobar, fallar, reintentar…). */
@@ -282,7 +423,9 @@ export function deleteAutomationWebhook(name: string): Promise<{ deleted: string
 }
 
 /** Rota el token. El nuevo valor solo se devuelve en esta respuesta. */
-export function rotateAutomationWebhookToken(name: string): Promise<{ name: string; token: string }> {
+export function rotateAutomationWebhookToken(
+	name: string
+): Promise<{ name: string; token: string }> {
 	return apiJson<{ name: string; token: string }>(
 		'automation',
 		`/automation/webhooks/${encodeURIComponent(name)}/token`,
@@ -349,11 +492,7 @@ type RegistryKind = 'filewatches' | 'crons';
 
 const REGISTRY_KEYS: Record<RegistryKind, string> = { filewatches: 'filewatches', crons: 'crons' };
 
-function registryJson<T>(
-	kind: RegistryKind,
-	suffix = '',
-	init: RequestInit = {}
-): Promise<T> {
+function registryJson<T>(kind: RegistryKind, suffix = '', init: RequestInit = {}): Promise<T> {
 	return apiJson<T>('automation', `/automation/${kind}${suffix}`, init);
 }
 
@@ -392,18 +531,15 @@ function deleteRegistryEntry(kind: RegistryKind, name: string): Promise<{ delete
 export type FileWatchInput = Omit<Partial<AutomationFileWatch>, 'last_run' | 'last_status'> & {
 	name: string;
 };
-export type CronInput = Omit<
-	Partial<AutomationCron>,
-	'last_run' | 'last_status' | 'next_run'
-> & { name: string };
+export type CronInput = Omit<Partial<AutomationCron>, 'last_run' | 'last_status' | 'next_run'> & {
+	name: string;
+};
 
 export function listFileWatches(): Promise<RegistryListing<AutomationFileWatch>> {
 	return listRegistry<AutomationFileWatch>('filewatches');
 }
 
-export function saveFileWatch(
-	input: FileWatchInput
-): Promise<{ item: AutomationFileWatch }> {
+export function saveFileWatch(input: FileWatchInput): Promise<{ item: AutomationFileWatch }> {
 	return saveRegistryEntry<{ item: AutomationFileWatch }>('filewatches', input);
 }
 
@@ -413,11 +549,9 @@ export function deleteFileWatch(name: string): Promise<{ deleted: string }> {
 
 /** Fuerza un escaneo de la carpeta ahora mismo. */
 export function scanFileWatch(name: string): Promise<{ enqueued: number }> {
-	return registryJson<{ enqueued: number }>(
-		'filewatches',
-		`/${encodeURIComponent(name)}/scan`,
-		{ method: 'POST' }
-	);
+	return registryJson<{ enqueued: number }>('filewatches', `/${encodeURIComponent(name)}/scan`, {
+		method: 'POST'
+	});
 }
 
 export function listCrons(): Promise<RegistryListing<AutomationCron>> {
@@ -489,7 +623,11 @@ export function pauseDispatcher(
 	return apiJson<{ dispatcher: AutomationDispatcherCard }>(
 		'automation',
 		`/automation/dispatchers/${encodeURIComponent(kind)}/pause`,
-		{ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason }) }
+		{
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ reason })
+		}
 	);
 }
 
@@ -536,18 +674,26 @@ export function getExecutorStatus(): Promise<{ executor: AutomationExecutorStatu
 
 /** Pausa el ejecutor: los workers terminan lo que tienen y dejan de reclamar. */
 export function pauseExecutor(reason = ''): Promise<{ executor: AutomationExecutorStatus }> {
-	return apiJson<{ executor: AutomationExecutorStatus }>('automation', '/automation/executor/pause', {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ reason })
-	});
+	return apiJson<{ executor: AutomationExecutorStatus }>(
+		'automation',
+		'/automation/executor/pause',
+		{
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ reason })
+		}
+	);
 }
 
 /** Reanuda el ejecutor y saca el backlog al instante (despierta a los workers). */
 export function resumeExecutor(): Promise<{ executor: AutomationExecutorStatus }> {
-	return apiJson<{ executor: AutomationExecutorStatus }>('automation', '/automation/executor/resume', {
-		method: 'POST'
-	});
+	return apiJson<{ executor: AutomationExecutorStatus }>(
+		'automation',
+		'/automation/executor/resume',
+		{
+			method: 'POST'
+		}
+	);
 }
 
 /** Historial unificado de eventos generados por los dispatchers. */

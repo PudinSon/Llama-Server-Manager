@@ -8,7 +8,6 @@ import json
 import time
 import threading
 import logging
-import re
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime, timedelta
@@ -642,90 +641,108 @@ class DaemonAgent:
                 logger.info(f"✅ Plan expandido con {len(new_tasks)} tareas adicionales.")
 
     def _generate_initial_plan(self) -> List[Dict]:
-        """Genera un plan inicial usando el LLM con fallback robusto."""
-        prompt = f"""
-Eres un planificador de proyectos. El usuario tiene el siguiente objetivo:
-"{self.objective}"
+        """Plan determinista por plantillas, con los agentes REALES del catálogo.
 
-El proyecto se encuentra en el workspace: {self.workspace_path}
+        Antes esto era una llamada al LLM con las especialidades hardcodeadas
+        "Investigación", "Economía", "Código" y "General": agentes que ya no
+        existen en el catálogo (se eliminaron en la limpieza del modo agente), así
+        que el daemon planificaba con nombres fantasma y cada ciclo pagaba una
+        generación completa para pedir un JSON que después había que reparar.
 
-Genera un plan detallado en formato JSON con pasos secuenciales.
-Cada paso debe tener: id, description, agent, depends_on (lista de ids vacía), status ("pending").
+        Ahora el plan sale del mismo `pipeline_templates` que usa el modo AGENCY,
+        con el sub-catálogo del dominio de la tarea. Si no hay catálogo, un único
+        paso con el objetivo (el daemon sigue funcionando sin agentes Agency).
+        """
+        from . import agency_domains, pipeline_templates, task_router
+        from .agency_catalog import create_default_catalog
 
-Especialidades disponibles: "Investigación", "Economía", "Código", "General".
+        agents: List[Dict] = []
+        root = None
+        try:
+            catalog = create_default_catalog()
+            agents = catalog.load()
+            root = getattr(catalog, "root", None)
+        except Exception as exc:  # catálogo ausente o ilegible
+            logger.warning(f"Sin catálogo Agency para planificar: {exc}")
 
-IMPORTANTE: Responde SOLO con el JSON, sin texto adicional.
+        if not agents:
+            logger.warning("Plan de un paso: no hay agentes en el catálogo")
+            return [self._single_step_plan()]
 
-Ejemplo de respuesta correcta:
-[
-  {{"id": "1", "description": "Listar el directorio actual para entender la estructura", "agent": "Código", "depends_on": [], "status": "pending"}},
-  {{"id": "2", "description": "Crear el archivo 'hola.txt' con el contenido indicado", "agent": "Código", "depends_on": [], "status": "pending"}}
-]
-"""
-        messages = [{"role": "user", "content": prompt}]
-        
-        # Intentar hasta 3 veces
-        for attempt in range(3):
-            try:
-                response = self.orchestrator.llm_client.chat(messages)
-                if "error" in response:
-                    logger.error(f"Error en intento {attempt+1}: {response['error']}")
-                    continue
-                
-                plan_text = response.get("content", "").strip()
-                # Limpiar posibles markdown
-                plan_text = re.sub(r'```json\s*', '', plan_text)
-                plan_text = re.sub(r'```\s*', '', plan_text)
-                
-                # Intentar parsear JSON
-                import json
-                plan = json.loads(plan_text)
-                if isinstance(plan, list) and len(plan) > 0:
-                    # Validar estructura mínima
-                    for task in plan:
-                        if "id" not in task:
-                            task["id"] = f"task_{len(plan)}"
-                        if "status" not in task:
-                            task["status"] = "pending"
-                        if "depends_on" not in task:
-                            task["depends_on"] = []
-                        if "agent" not in task:
-                            task["agent"] = "General"
-                    logger.info(f"📋 Plan generado con {len(plan)} tareas.")
-                    return plan
-            except json.JSONDecodeError as e:
-                logger.warning(f"Error parseando JSON en intento {attempt+1}: {e}")
-            except Exception as e:
-                logger.error(f"Error en intento {attempt+1}: {e}")
-        
-        # Fallback: plan simple y seguro
-        logger.warning("Usando plan de fallback (simple)")
+        decision = task_router.decide(self.objective)
+        candidates = agency_domains.select(agents, decision.get("domains"), root=root)
+        plan = pipeline_templates.build_plan(
+            self.objective,
+            candidates,
+            nature=decision["nature"],
+            domains=decision.get("domains"),
+            decompose=decision.get("requires_decomposition"),
+        )
+        steps = plan.get("steps") or []
+        if not steps:
+            logger.warning("Plan de un paso: la plantilla no devolvió pasos")
+            return [self._single_step_plan()]
+
+        logger.info(
+            f"📋 Plan determinista ({plan.get('pipeline')}): {len(steps)} tareas"
+        )
         return [
-            {"id": "1", "description": self.objective, "agent": "Código", "depends_on": [], "status": "pending"}
+            {
+                "id": str(step["id"]),
+                "description": step["subtask"],
+                "agent": step["agent"],
+                "depends_on": list(step.get("depends_on") or []),
+                "status": "pending",
+            }
+            for step in steps
         ]
 
-    def _expand_plan(self) -> List[Dict]:
-        """Genera tareas adicionales para expandir el plan."""
-        # Si hay tareas fallidas, generar tareas de corrección
-        failed_tasks = self.state.get("failed_tasks", [])
-        if failed_tasks:
-            # Tomar la última tarea fallida y generar una corrección
-            last_failed = failed_tasks[-1]
-            prompt = f"""
-La siguiente tarea falló:
-- ID: {last_failed.get('id')}
-- Descripción: {last_failed.get('description')}
-- Error: {last_failed.get('error')}
+    def _single_step_plan(self) -> Dict:
+        """Plan mínimo y seguro para cuando no hay catálogo utilizable."""
+        return {
+            "id": "1",
+            "description": self.objective,
+            "agent": "General",
+            "depends_on": [],
+            "status": "pending",
+        }
 
-Genera una tarea de corrección para resolver este problema.
-Responde con un JSON con: id, description, agent, depends_on (lista de ids), status.
-"""
-            messages = [{"role": "user", "content": prompt}]
-            response = self.orchestrator.llm_client.chat(messages)
-            if "error" not in response:
-                # Parsear respuesta...
-                pass
-        return []
+    def _expand_plan(self) -> List[Dict]:
+        """Tarea correctiva determinista para el último fallo (sin LLM).
+
+        Antes pedía al modelo una tarea de corrección y DESCARTABA la respuesta
+        —el parseo quedaba en `pass`—, así que la "expansión" no hacía nada y
+        costaba una llamada completa cada vez que quedaban menos de 3 pendientes.
+
+        Acotado a propósito: como mucho una corrección por tarea fallida (id
+        `<id>C`); si esa corrección también falla, no se encadena otra.
+        """
+        from . import pipeline_templates
+
+        failed_tasks = self.state.get("failed_tasks", [])
+        if not failed_tasks:
+            return []
+        last_failed = failed_tasks[-1]
+        source_id = str(last_failed.get("id") or "")
+        if not source_id:
+            return []
+        if f"{source_id}C" in {str(task.get("id")) for task in self.state.get("plan", [])}:
+            return []
+        recovery = pipeline_templates.recovery_step(
+            {
+                "id": source_id,
+                "subtask": last_failed.get("description", ""),
+                "agent_name": last_failed.get("agent", ""),
+            },
+            last_failed.get("error", ""),
+        )
+        return [{
+            "id": f"{source_id}C",
+            "description": recovery["subtask"],
+            "agent": recovery["agent_name"] or last_failed.get("agent") or "General",
+            "depends_on": [],
+            "status": "pending",
+        }]
 
     def _build_task_agent(self, agent_name: str):
         """Agente para un paso del plan, con el system prompt que usa el resto del sistema.
@@ -786,6 +803,27 @@ Responde con un JSON con: id, description, agent, depends_on (lista de ids), sta
             task_id = task.get("id")
             description = task.get("description", "")
             agent_name = task.get("agent", "General")
+            dependencies = {str(item) for item in (task.get("depends_on") or [])}
+            completed = {
+                str(item.get("id")): item
+                for item in self.state.get("completed_tasks", [])
+                if isinstance(item, dict)
+            }
+            if not dependencies <= completed.keys():
+                continue
+
+            handoff = [
+                {
+                    "id": dependency,
+                    "description": completed[dependency].get("description", ""),
+                    "result": completed[dependency].get("result", ""),
+                }
+                for dependency in dependencies
+            ]
+            context = json.dumps(
+                {"goal": self.objective, "dependencies": handoff},
+                ensure_ascii=False,
+            )
             
             try:
                 agent = self._build_task_agent(agent_name)
@@ -798,6 +836,7 @@ Responde con un JSON con: id, description, agent, depends_on (lista de ids), sta
                 
                 result = agent.run_stream(
                     description,
+                    context=context,
                     bus=step_bus,
                     reasoning=self.orchestrator.reasoning,
                 )

@@ -25,6 +25,11 @@ export interface UseContextGaugeReturn {
 	readonly cumulativeRead: number;
 	readonly cumulativeOutput: number;
 	readonly cumulativeCacheTotal: number;
+	/** Consumo del modo agente: se muestra aparte y NO suma al contexto. */
+	readonly agentTokens: number;
+	readonly agentPromptTokens: number;
+	readonly agentOutputTokens: number;
+	readonly agentCacheTotal: number;
 	readonly averageTokensPerSecond: number | null;
 	readonly contextPercent: number | null;
 	readonly colorLevel: ColorLevel;
@@ -70,6 +75,7 @@ export function useContextGauge(): UseContextGaugeReturn {
 			contextStatsStore.cumulativeOutput > 0 ||
 			contextStatsStore.currentRead > 0 ||
 			contextStatsStore.currentOutput > 0 ||
+			contextStatsStore.agentTokens > 0 ||
 			contextStatsStore.averageTokensPerSecond !== null ||
 			transientDetails.length > 0
 	);
@@ -89,6 +95,18 @@ export function useContextGauge(): UseContextGaugeReturn {
 	return {
 		get activeModelId() {
 			return contextStatsStore.activeModelId;
+		},
+		get agentCacheTotal() {
+			return contextStatsStore.agentCacheTotal;
+		},
+		get agentOutputTokens() {
+			return contextStatsStore.agentOutputTokens;
+		},
+		get agentPromptTokens() {
+			return contextStatsStore.agentPromptTokens;
+		},
+		get agentTokens() {
+			return contextStatsStore.agentTokens;
 		},
 		get averageTokensPerSecond() {
 			return contextStatsStore.averageTokensPerSecond;

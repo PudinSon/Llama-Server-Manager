@@ -119,6 +119,8 @@ export interface AgencyStepMeta {
 	role: 'supervisor' | 'specialist';
 	/** Subtarea del plan que ejecuta el especialista (si la declaró). */
 	subtask?: string;
+	/** Fases agrupadas en este paso para evitar subdividir trabajo del mismo agente. */
+	phases?: string[];
 	/** Id del paso del plan (`task_id`) cuando lo emite un especialista. */
 	task_id?: string;
 }

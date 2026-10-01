@@ -206,6 +206,13 @@ DEFAULT_SETTINGS = {
     "enable_document_conversion": True,
     "enable_drives": True,
     "enable_classify": True,
+    # Skills, checkpoints y daemon: implementadas desde el principio pero NO
+    # registradas como herramientas, así que se anunciaban al modelo y fallaban
+    # al ejecutarse ("Herramienta no encontrada"). Ahora la superficie coincide
+    # con `tool_taxonomy.TOOL_DESCRIPTIONS`.
+    "enable_skills": True,
+    "enable_checkpoints": True,
+    "enable_daemon": True,
     "enable_rag": True,
     "enable_memory": True,
     "enable_core_tools": True,
@@ -217,9 +224,9 @@ DEFAULT_SETTINGS = {
     # → 5-10× más lento en CPU. Desactivar si los agentes solo procesan
     # texto, RAG o código.
     "enable_multimodal": True,
-    # Router Laya ONNX: clasificador de modo/naturaleza (~650 MB, ~100× más
-    # rápido que el ToolRouter de Gemma). Si el modelo no está descargado o
-    # falla la carga, el orquestador cae a Gemma sin romper nada.
+    # Router Laya ONNX: clasificador de modo/naturaleza/dominio (~650 MB,
+    # ~100× más rápido que una llamada LLM). Si el modelo no está descargado o
+    # falla la carga, el orquestador usa las heurísticas léxicas de task_router.
     "laya_enabled": True,      # activar el router Laya
     "laya_preload": False,     # cargar al arranque en vez de en la 1ª ruta
     # Herramientas permitidas por `execute` (lista blanca aplicada por el wrapper)
@@ -3278,65 +3285,15 @@ def get_checkpoint_info(checkpoint_id: str) -> str:
         return f"❌ Error obteniendo información: {e}"
     
 # ============================================================
-# HERRAMIENTAS DE EJECUCIÓN SECUENCIAL
+# (Eliminado) HERRAMIENTAS DE EJECUCIÓN "PARALELA"
 # ============================================================
+# Aquí vivía `execute_parallel`, una herramienta que prometía paralelismo y
+# en realidad ejecutaba en serie creando agentes "General" hardcodeados, con un
+# kwarg que ya no existe (`dynamic_tools=True`) → fallaba en cada llamada. La
+# orquestación (paralela y en serie) es trabajo del orquestador determinista
+# (`parallel_executor`, `pipeline_templates`), no de una herramienta que deja
+# al LLM decidir el reparto del trabajo.
 
-def execute_parallel(tasks_json: str, context_json: str = "{}", max_workers: int = None) -> str:
-    """
-    Ejecuta tareas en serie por compatibilidad con el nombre histórico.
-    tasks_json: JSON con lista de tareas (id, subtask, agent_name, depends_on).
-    context_json: JSON con contexto compartido.
-    """
-    try:
-        from .agent_core import Agent, LLMClient
-        
-        tasks = json.loads(tasks_json)
-        if not isinstance(tasks, list):
-            return "❌ tasks_json debe ser una lista de tareas."
-        
-        context = json.loads(context_json) if context_json else {}
-        
-        def agent_factory(task_context):
-            return Agent(
-                name=task_context.get("agent_name", "General"),
-                instructions="Eres un asistente útil. Completa la tarea asignada.",
-                llm_client=LLMClient(),
-                max_iterations=10,
-                dynamic_tools=True
-            )
-        
-        results = []
-        sequential_context = dict(context) if isinstance(context, dict) else {}
-        for index, task in enumerate(tasks):
-            task_id = task.get("id", f"task_{index}")
-            agent_name = task.get("agent_name", "General")
-            try:
-                agent = agent_factory({"agent_name": agent_name})
-                result = agent.run(
-                    task.get("subtask", ""),
-                    context=json.dumps(sequential_context, ensure_ascii=False),
-                )
-                results.append({"task_id": task_id, "agent_name": agent_name, "success": True, "result": result})
-                sequential_context[agent_name] = result
-            except Exception as error:
-                results.append({"task_id": task_id, "agent_name": agent_name, "success": False, "error": str(error)})
-        
-        output = "📊 **Resultados de ejecución secuencial:**\n\n"
-        for r in results:
-            status = "✅" if r.get("success") else "❌"
-            output += f"{status} **{r.get('task_id', 'unknown')}** ({r.get('agent_name', 'General')})\n"
-            if r.get("success"):
-                output += f"   Resultado: {r.get('result', '')[:200]}...\n"
-            else:
-                output += f"   Error: {r.get('error', 'desconocido')}\n"
-            output += "\n"
-        
-        return output
-    except json.JSONDecodeError:
-        return "❌ Error: JSON inválido."
-    except Exception as e:
-        return f"❌ Error en ejecución paralela: {e}"
-    
 # ============================================================
 # HERRAMIENTAS PARA EL MODO DAEMON
 # ============================================================
@@ -3523,6 +3480,36 @@ def get_all_tool_functions() -> Dict[str, Callable]:
             # Chat completion
             "chat_completion": chat_completion,
         })
+
+    # ========== SKILLS, CHECKPOINTS Y DAEMON ==========
+    # Estaban implementadas pero sin registrar: `TOOL_DESCRIPTIONS` las
+    # anunciaba y `query_tools` podía proponerlas, mientras `execute_tool`
+    # devolvía "Herramienta no encontrada". La auditoría de `tool_taxonomy`
+    # reportaba esa deriva (`described_not_implemented`); ahora la superficie
+    # ejecutable y lo anunciado son lo mismo, y hay un test que lo comprueba.
+    if settings.get("enable_skills", True):
+        tools.update({
+            "list_skills": list_skills,
+            "get_skill": get_skill,
+            "create_skill": create_skill,
+            "promote_skill": promote_skill,
+            "delete_skill": delete_skill,
+        })
+    if settings.get("enable_checkpoints", True):
+        tools.update({
+            "create_checkpoint": create_checkpoint,
+            "list_checkpoints": list_checkpoints,
+            "rollback_checkpoint": rollback_checkpoint,
+            "delete_checkpoint": delete_checkpoint,
+            "get_checkpoint_info": get_checkpoint_info,
+        })
+    if settings.get("enable_daemon", True):
+        tools.update({
+            "start_daemon_tool": start_daemon_tool,
+            "stop_daemon_tool": stop_daemon_tool,
+            "daemon_status_tool": daemon_status_tool,
+        })
+
     # Añadir delete_directory manualmente
     def delete_directory(path: str) -> str:
         try:
@@ -3541,177 +3528,30 @@ def get_all_tool_functions() -> Dict[str, Callable]:
     return tools
 
 # ============================================================
-# LÓGICA DE FILTRADO PARA QUERY_TOOLS (desde agent_core)
+# TAXONOMÍA DE HERRAMIENTAS (única para todo el runtime)
 # ============================================================
-
-TOOL_DESCRIPTIONS = {
-    "read_file": "Lee archivos de texto plano (.txt, .py, .json, .csv, .md, .html, etc.). Si el contenido es JSON, lo formatea automaticamente para mayor legibilidad. No soporta archivos Office (.docx, .xlsx, .pptx). Ejemplo: read_file('datos.json')",
-    "write_file": "Escribe archivos de texto plano (.txt, .py, .json, .csv, .md, .html, etc.). Parametro mode: 'w' (escribir, por defecto) o 'a' (append). No soporta archivos Office. Ejemplo: write_file('salida.txt', 'contenido')",
-    "edit_file": "Edita archivos de texto plano sin perder formato. Operaciones: replace, append, insert_after, insert_before, delete. Si no se especifica operation, detecta automaticamente (old_text+new_text=replace, solo new_text=append). No soporta archivos Office. Ejemplo: edit_file('config.txt', old_text='valor_viejo', new_text='valor_nuevo')",
-    "apply_diff": "Aplica un patch unificado (diff) a un archivo. Útil para aplicar cambios generados por otros sistemas. Sinónimos: patch, aplicar cambios.",
-    "file_glob_search": "Busca archivos usando patrones glob (*, ?). Útil para encontrar archivos por nombre o extensión. Sinónimos: buscar archivos, find, ls **/*.",
-    "grep_search": "Busca texto dentro de archivos usando expresiones regulares. Útil para encontrar código, palabras clave o configuraciones. Sinónimos: buscar texto, grep, findstr.",
-    "exec_shell_command": "Ejecuta un comando en la shell del sistema. Poderoso pero restringido a comandos seguros. Sinónimos: ejecutar comando, run, sh, cmd.",
-    "get_datetime": "Obtiene la fecha y hora actual del sistema. Útil para timestamps, logs, o saber qué hora es. Sinónimos: fecha, hora, timestamp, now.",
-    "create_directory": "Crea un nuevo directorio o carpeta. Útil para organizar archivos o preparar espacio. Sinónimos: mkdir, crear carpeta, new folder.",
-    "list_directory": "Lista un directorio y, opcionalmente, sus subdirectorios. Uso: execute_tool(tool_name='list_directory', arguments={'path': '.', 'depth': 2}). depth=0 muestra sólo el nivel indicado; depth=1 incluye hijos; depth=2 incluye nietos.",
-    "delete_file": "Mueve un archivo o directorio a la papelera de reciclaje (seguro). Sinónimos: borrar, eliminar, trash, rm (seguro).",
-    "move_file": "Mueve o renombra un archivo o directorio. Útil para reorganizar. Sinónimos: mv, renombrar, mover.",
-    "compress_files": "Comprime archivos en un zip. Útil para empaquetar, reducir tamaño. Sinónimos: zip, comprimir, empaquetar.",
-    "extract_archive": "Extrae archivos de un zip o rar. Útil para descomprimir. Sinónimos: unzip, descomprimir, extraer.",
-    "create_venv": "Crea un entorno virtual de Python aislado. Útil para gestionar dependencias. Sinónimos: venv, virtualenv, entorno virtual.",
-    "run_python_code": "Ejecuta código Python en un entorno virtual o sistema (síncrono, ~30s). Útil para automatizar, calcular, procesar datos. Sinónimos: python, ejecutar script.",
-    "run_command_async": "Lanza un comando o proceso LARGO en segundo plano y devuelve un job_id al instante, sin bloquear la conversación ni abrir consola. Úsalo para pip install, builds, servidores, descargas y scripts largos. Ejemplo: run_command_async('pip install pandas')",
-    "job_status": "Estado de un job lanzado con run_command_async: running/exited/error/killed, exit_code y tiempo transcurrido. Ejemplo: job_status('a1b2c3d4')",
-    "job_output": "Lee las últimas líneas de la salida de un job. tail=0 devuelve todo. Ejemplo: job_output('a1b2c3d4', tail=200)",
-    "job_kill": "Detiene un job en ejecución matando su árbol de procesos. Ejemplo: job_kill('a1b2c3d4')",
-    "job_list": "Lista los jobs de la sesión (running/exited/error) con su comando y tiempos.",
-    "workspace_download_link": "Devuelve una URL absoluta (válida también en remoto o tras nginx) para descargar o ver un archivo del workspace. Ejemplo: workspace_download_link('informe.pdf')",
-    "sqlite_query": "Ejecuta consultas SQL (SELECT) en una base SQLite. Útil para extraer datos. Sinónimos: SQL, consulta, SELECT.",
-    "sqlite_execute": "Ejecuta comandos SQL (INSERT, UPDATE, DELETE) en SQLite. Sinónimos: modificar SQL, INSERT, UPDATE.",
-    "get_db_schema": "Obtiene el esquema de una base SQLite (tablas y columnas). Útil para conocer la estructura. Sinónimos: schema, estructura, tablas.",
-    "list_processes": "Lista los procesos del sistema en ejecución. Sinónimos: ps, tasklist, procesos.",
-    "kill_process": "Termina un proceso por su PID. Sinónimos: matar proceso, taskkill.",
-    "screenshot": "Captura la pantalla completa y guarda una imagen. Sinónimos: print screen, captura de pantalla.",
-    "take_photo": "Toma una foto con la cámara web. Sinónimos: foto, selfie, cámara.",
-    "notify": "Envía una notificación del sistema al usuario. Sinónimos: alerta, popup, notificar.",
-    "open_url": "Abre una URL en el navegador predeterminado. Sinónimos: navegar, abrir web, visitar.",
-    "add_task": "Añade una tarea a la lista TODO. Sinónimos: tarea, pendiente, añadir tarea.",
-    "list_tasks": "Lista las tareas pendientes o completadas. Sinónimos: todo, pendientes.",
-    "complete_task": "Marca una tarea como completada. Sinónimos: terminar, finalizar.",
-    "set_reminder": "Programa un recordatorio para después de N segundos. Sinónimos: recordar, alarma, timer.",
-    "print_file": "Envía un archivo a la impresora (Windows o CUPS). Sinónimos: imprimir, imprimir archivo.",
-    "open_file_with_default_app": "Abre un archivo con su aplicación predeterminada (ej. .pdf, .docx). Sinónimos: abrir, launch.",
-    "rag_search": "Busca información en documentos indexados (RAG) usando búsqueda semántica híbrida. Útil para investigar, recuperar información de documentos. Sinónimos: buscar documento, investigar, buscar en documentos, RAG.",
-    "list_libraries": "Lista los documentos indexados en la biblioteca RAG activa. Sinónimos: bibliotecas, documentos indexados.",
-    "set_active_library": "Cambia la biblioteca activa de RAG. Sinónimos: cambiar biblioteca, activar.",
-    "store_memory": "Guarda un fragmento en la memoria del agente para recordarlo después. Sinónimos: recordar, guardar contexto.",
-    "retrieve_memories": "Recupera memorias relevantes del agente. Sinónimos: recordar, memoria.",
-    "send_telegram": "Envía un mensaje por Telegram usando el bot configurado. Sinónimos: telegram, mensaje.",
-    "setup_telegram": "Configura las credenciales del bot de Telegram. Sinónimos: configurar bot, token.",
-    "download_file": "Descarga un archivo desde una URL. Sinónimos: descargar, wget, curl.",
-    "git_status": "Muestra el estado del repositorio git (archivos modificados). Sinónimos: git status.",
-    "git_commit": "Realiza un commit en git con los cambios añadidos. Sinónimos: git commit.",
-    "git_diff": "Muestra las diferencias entre cambios en git. Sinónimos: git diff.",
-    "git_log": "Muestra el historial de commits en git. Sinónimos: git log.",
-    "start_watchdog": "Inicia el monitor de cambios en archivos (watchdog). Sinónimos: monitorear, vigilar cambios.",
-    "stop_watchdog": "Detiene el monitor de cambios. Sinónimos: detener monitor.",
-    "get_watchdog_events": "Obtiene los eventos registrados por el monitor. Sinónimos: eventos, cambios.",
-    "convert_document": "Convierte documentos entre formatos (usando pandoc o fallback). Sinónimos: convertir, transformar, pandoc.",
-    "list_drives": "Lista las unidades de disco disponibles (Windows/Linux). Sinónimos: unidades, discos.",
-    "classify_text": "Clasifica un texto en categorías usando el LLM. Sinónimos: clasificar, categorizar.",
-    "delegate_to_agent": "Delega una subtarea a otro agente especializado. Útil cuando necesitas ayuda de un experto. Sinónimos: delegar, handoff, pedir ayuda.",
-    "delete_directory": "Elimina un directorio y todo su contenido de forma recursiva. Sinónimos: borrar directorio, eliminar carpeta, rmdir, rm -rf.",
-    "lint_code": "Analiza el código Python en busca de errores de estilo y problemas comunes usando flake8.",
-    "check_security": "Busca vulnerabilidades de seguridad en el código Python usando bandit.",
-    "type_check": "Verifica la consistencia de tipos estáticos usando pyright.",
-    "measure_complexity": "Mide la complejidad ciclomática del código usando radon.",
-    "run_tests": "Ejecuta pruebas unitarias con pytest y muestra los resultados.",
-    "generate_unit_tests": "Genera pruebas unitarias para una función o archivo usando IA.",
-    "generate_docstrings": "Añade docstrings a funciones y métodos usando IA.",
-    "generate_readme": "Genera un archivo README.md para el proyecto usando IA.",
-    "generate_api_docs": "Genera documentación API con pdoc o sphinx.",
-    "format_code": "Formatea el código Python usando black.",
-    "sort_imports": "Ordena y agrupa los imports usando isort.",
-    "remove_unused_imports": "Elimina imports no utilizados usando autoflake.",
-    "clean_code": "Limpia el código: elimina imports no usados, ordena y formatea.",
-    "add_license": "Añade un encabezado de licencia a los archivos .py.",
-    "check_dependencies": "Revisa vulnerabilidades en las dependencias del proyecto.",
-    "check_system_tool": "Verifica si una herramienta del sistema está instalada.",
-    "install_system_tool": "Proporciona instrucciones para instalar una herramienta del sistema.",
-    "review_code": "Genera un informe completo de calidad del código.",
-    "summarize_changes": "Resume los cambios desde el último checkpoint.",
-    "chat_completion": "Envía mensajes al LLM y devuelve la respuesta (sin herramientas).",
-    "list_skills": "Lista los skills disponibles (memoria procedimental).",
-    "get_skill": "Obtiene el contenido completo de un skill por su nombre.",
-    "create_skill": "Crea un nuevo skill con pasos definidos.",
-    "promote_skill": "Promueve un skill auto-generado a skill permanente.",
-    "delete_skill": "Elimina un skill del workspace.",
-    "create_checkpoint": "Crea un checkpoint del estado actual del proyecto.",
-    "list_checkpoints": "Lista los checkpoints disponibles.",
-    "rollback_checkpoint": "Restaura el proyecto y/o estado del agente desde un checkpoint.",
-    "delete_checkpoint": "Elimina un checkpoint específico.",
-    "get_checkpoint_info": "Obtiene información detallada de un checkpoint.",
-    "execute_parallel": "Ejecuta múltiples tareas en paralelo. Útil cuando hay subtareas independientes que pueden resolverse simultáneamente.",
-    "start_daemon_tool": "Inicia el agente en modo daemon para trabajar de forma autónoma en segundo plano.",
-    "stop_daemon_tool": "Detiene el daemon en ejecución.",
-    "daemon_status_tool": "Muestra el estado actual del daemon.",
-}
-
-BASE_TOOLS_CHEATSHEET = (
-    "Tools base vía execute_tool(tool_name, arguments): "
-    "read_file(path), write_file(path,content), edit_file(path,old_text,new_text), "
-    "file_glob_search(pattern,path='.'), grep_search(pattern,path='.'), "
-    "exec_shell_command(command), get_datetime(), list_directory(path,depth=0), "
-    "run_python_code(code,venv=None), run_command_async(command), job_output(job_id), "
-    "job_status(job_id), job_kill(job_id). Úsalas directamente; no necesitas query_tools para estas. "
-    "Si dudas, usa query_tools."
-)
-
-TOOL_CATEGORIES = {
-    "filesystem": ["list_directory", "create_directory", "delete_file", "delete_directory", "move_file", "read_file", "write_file", "edit_file", "apply_diff", "file_glob_search", "grep_search"],
-    "system": ["exec_shell_command", "get_datetime", "list_processes", "kill_process", "list_drives"],
-    "db": ["sqlite_query", "sqlite_execute", "get_db_schema"],
-    "rag": ["rag_search", "list_libraries", "set_active_library"],
-    "code": ["run_python_code", "create_venv"],
-    "jobs": ["run_command_async", "job_status", "job_output", "job_kill", "job_list"],
-    "git": ["git_status", "git_commit", "git_diff", "git_log"],
-    "media": ["screenshot", "take_photo", "notify"],
-    "telegram": ["send_telegram", "setup_telegram"],
-    "todo": ["add_task", "list_tasks", "complete_task"],
-    "network": ["open_url", "download_file"],
-    "compression": ["compress_files", "extract_archive"],
-    "printing": ["print_file"],
-    "watchdog": ["start_watchdog", "stop_watchdog", "get_watchdog_events"],
-    "conversion": ["convert_document", "classify_text"],
-    "code_quality": ["lint_code", "check_security", "type_check", "measure_complexity"],
-    "testing": ["run_tests", "generate_unit_tests"],
-    "documentation": ["generate_docstrings", "generate_readme", "generate_api_docs"],
-    "refactoring": ["format_code", "sort_imports", "remove_unused_imports", "clean_code"],
-    "security": ["add_license", "check_dependencies"],
-    "system": ["check_system_tool", "install_system_tool"],
-    "review": ["review_code", "summarize_changes"],
-    "skills": ["list_skills", "get_skill", "create_skill", "promote_skill", "delete_skill"],
-    "checkpoints": ["create_checkpoint", "list_checkpoints", "rollback_checkpoint", "delete_checkpoint", "get_checkpoint_info"],
-    "parallel": ["execute_parallel"],
-    "daemon": ["start_daemon_tool", "stop_daemon_tool", "daemon_status_tool"],
-}
-
-CATEGORY_KEYWORDS = {
-    "filesystem": ["directorio", "carpeta", "archivo", "file", "listar", "crear", "borrar", "mover", "editar", "buscar archivo", "renombrar", "eliminar", "borrar"],
-    "system": ["sistema", "shell", "comando", "proceso", "fecha", "hora", "disco", "unidad", "ejecutar", "correr"],
-    "db": ["base de datos", "sqlite", "sql", "tabla", "consulta", "schema", "esquema"],
-    "rag": ["rag", "documento", "biblioteca", "indexado", "buscar documento", "listar biblioteca"],
-    "code": ["python", "código", "ejecutar código", "entorno virtual", "venv"],
-    "jobs": ["job", "segundo plano", "background", "async", "pip install", "instalar dependencia", "proceso largo", "servidor", "build", "compilar", "descarga"],
-    "git": ["git", "commit", "pull", "push", "estado", "diff", "historial"],
-    "media": ["captura", "pantalla", "screenshot", "foto", "cámara", "notificación"],
-    "telegram": ["telegram", "bot", "mensaje", "chat"],
-    "todo": ["tarea", "todo", "pendiente", "completar", "lista"],
-    "network": ["url", "descargar", "navegador", "web"],
-    "compression": ["comprimir", "zip", "descomprimir", "extraer"],
-    "printing": ["imprimir"],
-    "watchdog": ["monitor", "cambios", "vigilar"],
-    "conversion": ["convertir", "formato", "clasificar"],
-    "code_quality": ["calidad código", "lint", "estilo", "seguridad", "tipos", "complejidad"],
-    "testing": ["pruebas", "tests", "pytest", "unit tests"],
-    "documentation": ["documentación", "docstrings", "README", "API docs"],
-    "refactoring": ["refactorizar", "formatear", "limpiar código", "ordenar imports"],
-    "security": ["licencia", "dependencias", "vulnerabilidades"],
-    "system": ["herramienta sistema", "instalar", "verificar"],
-    "review": ["revisión", "informe", "resumen cambios"],
-    "skills": ["skill", "memoria", "aprender", "lección", "procedimiento"],
-    "checkpoints": ["checkpoint", "rollback", "restaurar", "guardar estado", "persistencia", "snapshot"],
-    "parallel": ["paralelo", "simultáneo", "multiagente", "ejecutar en paralelo", "varias tareas"],
-    "daemon": ["daemon", "fondo", "autónomo", "continuo", "24/7", "servicio"],
-}
-
-# Mapeo de herramientas y sus parámetros que esperan un string JSON
-TOOLS_JSON_PARAMS = {
-    "create_skill": ["steps_json"],
-    "create_checkpoint": ["state_json"],
-    "execute_parallel": ["tasks_json", "context_json"],
-}
+# Descripciones, categorías, palabras clave y tipos viven en
+# `tools/tool_taxonomy.py`. Aquí solo se re-exportan: `query_tools`, el ranking
+# por embeddings y el prompt las siguen usando con su nombre de siempre, pero
+# ya no hay una segunda copia que pueda divergir de `agent_core`.
+try:
+    from tools.tool_taxonomy import (  # noqa: F401  (re-export)
+        BASE_TOOLS,
+        BASE_TOOLS_CHEATSHEET,
+        CATEGORY_KEYWORDS,
+        TOOL_CATEGORIES,
+        TOOL_DESCRIPTIONS,
+        TOOLS_JSON_PARAMS,
+    )
+except ImportError:  # ejecución suelta, sin paquete
+    from tool_taxonomy import (  # type: ignore  # noqa: F401
+        BASE_TOOLS,
+        BASE_TOOLS_CHEATSHEET,
+        CATEGORY_KEYWORDS,
+        TOOL_CATEGORIES,
+        TOOL_DESCRIPTIONS,
+        TOOLS_JSON_PARAMS,
+    )
 
 _tool_dense_cache = None
 
@@ -3748,10 +3588,25 @@ def _cosine_similarity(a, b):
         return 0.0
     return np.dot(a, b) / (a_norm * b_norm)
 
-def get_relevant_tools(query: str, top_k: int = 3) -> List[str]:
+def get_relevant_tools(query: str, top_k: int = 3,
+                       allowed: Optional[List[str]] = None) -> List[str]:
+    """Herramientas más relevantes para una consulta.
+
+    `allowed` es la whitelist del agente (ver `tool_policy`): si llega, solo se
+    devuelven herramientas permitidas. Sin esto el modelo veía en el resultado
+    herramientas que su policy le iba a denegar al ejecutarlas, y gastaba turnos
+    llamando a la puerta equivocada.
+    """
+    permitidas = frozenset(allowed) if allowed is not None else None
+
+    def _filter(names: List[str]) -> List[str]:
+        if permitidas is None:
+            return names
+        return [n for n in names if n in permitidas]
+
     dense_cache = _get_tool_embeddings_cache()
     if not dense_cache:
-        return ["list_directory", "read_file", "get_datetime"]
+        return _filter(["list_directory", "read_file", "get_datetime"])
 
     q_dense = None
     try:
@@ -3766,7 +3621,7 @@ def get_relevant_tools(query: str, top_k: int = 3) -> List[str]:
         pass
 
     if q_dense is None:
-        return ["list_directory", "read_file", "get_datetime"]
+        return _filter(["list_directory", "read_file", "get_datetime"])
 
     category_boost = {}
     query_lower = query.lower()
@@ -3792,10 +3647,12 @@ def get_relevant_tools(query: str, top_k: int = 3) -> List[str]:
     # Siempre incluir las básicas aunque el embedding no las haya encontrado
     # (antes el tope top_k impedía añadirlas: read_file faltaba en el contexto
     # del modelo y este caía en query(mode=read) para intentar leer archivos).
-    for tool in ("list_directory", "read_file", "write_file", "edit_file", "get_datetime", "exec_shell_command"):
+    # La lista vive en `tool_taxonomy.BASE_TOOLS` junto a su chuletas del prompt.
+    for tool in BASE_TOOLS:
         if tool not in top_tools:
             top_tools.append(tool)
 
+    top_tools = _filter(top_tools)
     logging.info(f"Herramientas seleccionadas para '{query[:30]}...': {top_tools}")
     return top_tools
 
@@ -3817,21 +3674,29 @@ _query_tools_cache = {}
 _QUERY_TOOLS_TTL = 30.0
 
 
-def query_tools_global(query: str) -> str:
+def query_tools_global(query: str, allowed: Optional[List[str]] = None) -> str:
     """
     Busca y devuelve las herramientas más relevantes para una consulta.
     Esta es la versión global que puede ser importada directamente.
     Con caché TTL: inspeccionar ~90 tools en cada llamada del router es caro.
+
+    `allowed` (whitelist del agente, ver `tool_policy`) forma parte de la clave
+    de caché: dos agentes con permisos distintos no pueden compartir la misma
+    entrada, o el segundo vería la lista del primero.
     """
-    key = (query or "").strip()
+    key = ((query or "").strip(),
+           None if allowed is None else tuple(sorted(allowed)))
     now = time.time()
     cached = _query_tools_cache.get(key)
     if cached and (now - cached[0]) < _QUERY_TOOLS_TTL:
         return cached[1]
 
-    relevant = get_relevant_tools(query, top_k=3)
+    relevant = get_relevant_tools(query, top_k=3, allowed=allowed)
     if not relevant:
-        return "No se encontraron herramientas relevantes."
+        return (
+            "No se encontraron herramientas relevantes"
+            + (" dentro de las permitidas para este agente." if allowed is not None else ".")
+        )
 
     all_tools = _get_all_tools()
     output = "🔧 **Herramientas relevantes:**\n\n"
@@ -5072,13 +4937,16 @@ def create_mcp_server(transport: str = "http"):
     # HERRAMIENTA QUERY_TOOLS (descubrimiento semántico con esquemas)
     # ============================================================
     @mcp.tool()
-    def query_tools(query: str) -> str:
+    def query_tools(query: str, allowed: Optional[List[str]] = None) -> str:
         """Busca y devuelve las herramientas más relevantes para una tarea.
         Tools base disponibles vía execute_tool: read_file, write_file, edit_file,
         file_glob_search, grep_search, exec_shell_command, get_datetime,
         list_directory, run_python_code.
+
+        `allowed` es la whitelist del agente que pregunta (`tool_policy`): si se
+        envía, la búsqueda solo devuelve herramientas permitidas para él.
         """
-        return query_tools_global(query)
+        return query_tools_global(query, allowed=allowed)
 
     # ============================================================
     # HERRAMIENTA EXECUTE_TOOL (ejecución robusta)
@@ -5282,13 +5150,18 @@ def _create_stdio_proxy_server():
     proxy = DevAgentHttpProxy()
 
     @mcp.tool()
-    def query_tools(query: str) -> str:
+    def query_tools(query: str, allowed: Optional[List[str]] = None) -> str:
         """Busca y devuelve las herramientas más relevantes para una tarea.
                 Tools base disponibles vía execute_tool: read_file, write_file, edit_file,
                 file_glob_search, grep_search, exec_shell_command, get_datetime,
                 list_directory, run_python_code.
+
+                `allowed` es la whitelist del agente que pregunta (`tool_policy`).
                 """
-        return proxy.call_tool("query_tools", {"query": query})
+        payload = {"query": query}
+        if allowed is not None:
+            payload["allowed"] = allowed
+        return proxy.call_tool("query_tools", payload)
 
     @mcp.tool()
     def execute_tool(tool_name: str = None, arguments: dict = None) -> str:

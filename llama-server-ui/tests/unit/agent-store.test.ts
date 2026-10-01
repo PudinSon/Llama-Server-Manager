@@ -1,137 +1,13 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agentStore } from '$lib/stores/agentStore.svelte';
+import { describe, expect, it } from 'vitest';
 
-type Listener = (event: MessageEvent) => void;
-
-class FakeEventSource {
-	static instances: FakeEventSource[] = [];
-	listeners = new Map<string, Listener[]>();
-	close = vi.fn();
-	onerror: (() => void) | null = null;
-	onopen: (() => void) | null = null;
-	onmessage: Listener | null = null;
-
-	constructor(public url: string) {
-		FakeEventSource.instances.push(this);
-	}
-
-	addEventListener(type: string, listener: Listener) {
-		this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
-	}
-
-	emit(type: string, payload: unknown) {
-		const event = { data: JSON.stringify(payload) } as MessageEvent;
-		this.emitRaw(type, event);
-	}
-
-	/** Evento nativo del navegador: un `Event` sin `data` (caída de conexión). */
-	emitRaw(type: string, event: Event | MessageEvent) {
-		for (const listener of this.listeners.get(type) ?? []) listener(event as MessageEvent);
-		if (type === 'message') this.onmessage?.(event as MessageEvent);
-	}
-}
-
-afterEach(() => {
-	vi.restoreAllMocks();
-	vi.unstubAllGlobals();
-	FakeEventSource.instances = [];
-});
-
-describe('agentStore execution transport', () => {
-	it('executes, consumes SSE events, cancels, and restores an active job', async () => {
-		const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-			const url = String(input);
-			if (url.endsWith('/agent_execute') && init?.method === 'POST') {
-				return new Response(JSON.stringify({ job_id: 'job-1', status: 'running' }), {
-					status: 202
-				});
-			}
-			if (url.endsWith('/agent_execute/job-1') && init?.method === 'DELETE') {
-				return new Response(JSON.stringify({ job_id: 'job-1', status: 'cancelled' }), {
-					status: 200
-				});
-			}
-			if (url.endsWith('/agent_jobs')) {
-				return new Response(JSON.stringify({ jobs: [{ id: 'job-2', status: 'running' }] }), {
-					status: 200
-				});
-			}
-			throw new Error(`Unexpected request: ${url}`);
-		});
-		vi.stubGlobal('fetch', fetchMock);
-		vi.stubGlobal('EventSource', FakeEventSource);
-
-		const jobId = await agentStore.execute('Inspect the project');
-		expect(jobId).toBe('job-1');
-		expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
-			agents: [],
-			context: undefined,
-			research: false,
-			task: 'Inspect the project'
-		});
-
-		const source = FakeEventSource.instances[0];
-		source.onopen?.();
-		source.emit('reasoning', { type: 'reasoning', payload: { text: 'Planning. ' } });
-		source.emit('tool_call', {
-			payload: { arguments: '{}', name: 'read_file' },
-			type: 'tool_call'
-		});
-		source.emit('tool_result', {
-			payload: { name: 'read_file', result: 'ok' },
-			type: 'tool_result'
-		});
-		source.emit('text', { payload: 'Done', type: 'text' });
-		source.emit('done', { payload: { content: 'Done' }, type: 'done' });
-
-		expect(agentStore.reasoning).toEqual(['Planning. ']);
-		expect(agentStore.response).toBe('Done');
-		expect(agentStore.events.map((event) => event.type)).toEqual([
-			'reasoning',
-			'tool_call',
-			'tool_result',
-			'text',
-			'done'
-		]);
-		expect(agentStore.isExecuting).toBe(false);
-
-		await agentStore.cancel();
-		// El host lo decide `serviceBase('agent')` (127.0.0.1 fuera del navegador,
-		// el host actual en modo directo), así que se compara contra el endpoint
-		// real del store en vez de fijar uno.
-		expect(fetchMock).toHaveBeenCalledWith(`${agentStore.config.endpoint}/agent_execute/job-1`, {
-			method: 'DELETE'
-		});
-
-		expect(await agentStore.restoreActiveJob()).toBe(true);
-		expect(agentStore.currentJobId).toBe('job-2');
-		expect(agentStore.isExecuting).toBe(true);
-	});
-
-	it('ignores the browser error event when the stream closes', async () => {
-		// El navegador entrega el error NATIVO (Event sin `data`) por el mismo
-		// listener que el evento SSE "error": parsearlo marcaba un falso
-		// "Evento SSE inválido" al cerrarse la conexión.
-		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-			const url = String(input);
-			if (url.endsWith('/agent_execute')) {
-				return new Response(JSON.stringify({ job_id: 'job-9', status: 'running' }), {
-					status: 202
-				});
-			}
-			throw new Error(`Unexpected request: ${url}`);
-		});
-		vi.stubGlobal('fetch', fetchMock);
-		vi.stubGlobal('EventSource', FakeEventSource);
-
-		await agentStore.execute('tarea');
-		const source = FakeEventSource.instances[0];
-
-		source.emitRaw('error', new Event('error'));
-
-		expect(agentStore.lastError).not.toBe('Evento SSE invalido');
-	});
-});	describe('agentStore timeline scoping', () => {
+/**
+ * El store de agentes ya NO es dueño de ningún stream: el panel recibe cada
+ * frame del job por `applyChatAgencyEvent`, el reductor ÚNICO que alimenta el
+ * chat que lanzó la tarea. El transporte SSE se prueba en
+ * `tests/unit/agency-stream.test.ts`.
+ */
+describe('agentStore timeline scoping', () => {
 	it('liga la timeline a la conversación que lanzó la ejecución', () => {
 		agentStore.beginAgencyTimeline('conv-1');
 
@@ -162,7 +38,8 @@ describe('agentStore execution transport', () => {
 		expect(agentStore.agencyRuns.every((run) => run.status === 'done')).toBe(true);
 	});
 });
-	describe('agentStore AGENCY timeline', () => {
+
+describe('agentStore AGENCY timeline', () => {
 	it('builds the plan, streams each agent into its own card and keeps the synthesis separate', () => {
 		agentStore.resetAgencyTimeline();
 		// `response` persiste entre ejecuciones (lo limpia el chat al abrir turno).
@@ -172,13 +49,15 @@ describe('agentStore execution transport', () => {
 			job_id: 'job-1',
 			payload: {
 				steps: [
-					{ id: 's1', agent: 'Analista', subtask: 'Investigar' },
-					{ id: 's2', agent: 'Redactor', subtask: 'Redactar', depends_on: ['s1'] }
-				]
+					{ agent: 'Analista', id: 's1', subtask: 'Investigar' },
+					{ agent: 'Redactor', depends_on: ['s1'], id: 's2', subtask: 'Redactar' }
+				],
+				task: 'Crea una API'
 			},
 			type: 'plan'
 		});
 		expect(agentStore.agencyPlan.map((step) => step.id)).toEqual(['s1', 's2']);
+		expect(agentStore.agencyGoal).toBe('Crea una API');
 		expect(agentStore.agencyPlan[1].agent_name).toBe('Redactor');
 
 		agentStore.applyChatAgencyEvent({
@@ -194,6 +73,7 @@ describe('agentStore execution transport', () => {
 		});
 
 		const run = agentStore.agencyRuns.find((item) => item.id === 's1');
+
 		expect(run?.status).toBe('running');
 		expect(run?.text).toBe('hallazgo');
 		// El texto del subagente no contamina la respuesta final.
@@ -234,5 +114,142 @@ describe('agentStore execution transport', () => {
 
 		agentStore.applyChatAgencyEvent({ job_id: 'job-1', payload: {}, type: 'done' });
 		expect(agentStore.isExecuting).toBe(false);
+	});
+});
+
+describe('agentStore plan (eventos reales del backend)', () => {
+	/** Pasos como los emite `pipeline_templates.build_plan`. */
+	const planSteps = [
+		{
+			agent: 'Backend Architect',
+			artifact: 'app/main.py',
+			id: 'setup',
+			phase: 'setup+core',
+			phases: ['setup', 'core'],
+			subtask: 'Andamiaje'
+		},
+		{
+			agent: 'API Tester',
+			artifact: 'tests/',
+			depends_on: ['setup'],
+			id: 'tests',
+			phase: 'tests',
+			subtask: 'Pruebas'
+		}
+	];
+
+	it('mueve el estado de cada paso con step_start / agent_start / step_end', () => {
+		agentStore.resetAgencyTimeline();
+
+		agentStore.applyChatAgencyEvent({
+			job_id: 'job-1',
+			payload: { steps: planSteps },
+			type: 'agency_selected'
+		});
+
+		expect(agentStore.agencyPlan.map((step) => step.phase)).toEqual(['setup+core', 'tests']);
+		expect(agentStore.agencyPlan.map((step) => step.status)).toEqual(['pending', 'pending']);
+		expect(agentStore.agencyPlan[0].artifact).toBe('app/main.py');
+		expect(agentStore.agencyPlan[0].phases).toEqual(['setup', 'core']);
+		expect(agentStore.agencyPlan[1].depends_on).toEqual(['setup']);
+
+		// `step_start` previsualiza el paso por índice (1-based), sin abrirlo.
+		agentStore.applyChatAgencyEvent({
+			job_id: 'job-1',
+			payload: { idx: 1, subtask: 'Andamiaje' },
+			type: 'step_start'
+		});
+		expect(agentStore.agencyPlan[0].status).toBe('running');
+
+		// `step_end` cierra la fila: antes no tenía case y el plan se quedaba
+		// "pendiente" toda la ejecución.
+		agentStore.applyChatAgencyEvent({
+			job_id: 'job-1',
+			payload: { agent: 'Backend Architect', task_id: 'setup' },
+			type: 'step_end'
+		});
+		expect(agentStore.agencyPlan[0].status).toBe('done');
+
+		// Un paso sin trabajo marca error, no "done".
+		agentStore.applyChatAgencyEvent({
+			job_id: 'job-1',
+			payload: { agent: 'API Tester', error: 'sin artefacto', task_id: 'tests' },
+			type: 'step_end'
+		});
+		expect(agentStore.agencyPlan[1].status).toBe('error');
+	});
+
+	it('conserva el trabajo hecho cuando el plan se replanifica', () => {
+		agentStore.resetAgencyTimeline();
+		agentStore.applyChatAgencyEvent({
+			job_id: 'job-1',
+			payload: { steps: planSteps },
+			type: 'agency_selected'
+		});
+		agentStore.applyChatAgencyEvent({
+			job_id: 'job-1',
+			payload: { agent: 'Backend Architect', task_id: 'setup' },
+			type: 'step_end'
+		});
+
+		// Recuperación: el backend reescribe el plan con el paso correctivo.
+		agentStore.applyChatAgencyEvent({
+			job_id: 'job-1',
+			payload: {
+				steps: [
+					...planSteps,
+					{ agent: 'API Tester', id: 'testsR1', subtask: '[CORRECCIÓN] Pruebas' }
+				]
+			},
+			type: 'plan'
+		});
+
+		expect(agentStore.agencyPlan.map((step) => step.id)).toEqual(['setup', 'tests', 'testsR1']);
+		expect(agentStore.agencyPlan[0].status).toBe('done');
+		expect(agentStore.agencyPlan[2].status).toBe('pending');
+	});
+
+	it('muestra el plan incompleto y las herramientas denegadas', () => {
+		agentStore.resetAgencyTimeline();
+		agentStore.applyChatAgencyEvent({
+			job_id: 'job-1',
+			payload: { steps: planSteps },
+			type: 'agency_selected'
+		});
+		agentStore.applyChatAgencyEvent({
+			job_id: 'job-1',
+			payload: { agent: 'API Tester', subtask: 'Pruebas', task_id: 'tests' },
+			type: 'agent_start'
+		});
+		agentStore.applyChatAgencyEvent({
+			job_id: 'job-1',
+			meta: { agent: 'API Tester', role: 'specialist', task_id: 'tests' },
+			payload: { agent: 'API Tester', name: 'kill_process', reason: 'perfil "testing"' },
+			type: 'tool_denied'
+		});
+
+		expect(agentStore.agencyDenials).toEqual([
+			{ agent: 'API Tester', name: 'kill_process', reason: 'perfil "testing"' }
+		]);
+		expect(agentStore.agencyRuns.find((run) => run.id === 'tests')?.denied).toEqual([
+			'kill_process'
+		]);
+
+		// `incomplete` es un AVISO (no cierra el job) y este evento no tenía case
+		// en ningún switch: el usuario no veía nada.
+		agentStore.applyChatAgencyEvent({
+			job_id: 'job-1',
+			payload: { agent: 'API Tester', reason: 'paso sin artefacto' },
+			type: 'incomplete'
+		});
+
+		expect(agentStore.agencyIncomplete).toBe('paso sin artefacto');
+		expect(agentStore.agencyPlan[1].status).toBe('error');
+		expect(agentStore.isExecuting).toBe(true);
+
+		agentStore.resetAgencyTimeline('conv-1');
+		expect(agentStore.agencyIncomplete).toBeNull();
+		expect(agentStore.agencyDenials).toEqual([]);
+		expect(agentStore.agencyPlan).toEqual([]);
 	});
 });
